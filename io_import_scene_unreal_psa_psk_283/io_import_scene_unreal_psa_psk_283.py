@@ -1,82 +1,3 @@
-# ##### BEGIN GPL LICENSE BLOCK #####
-#
-#  This program is free software; you can redistribute it and/or
-#  modify it under the terms of the GNU General Public License
-#  as published by the Free Software Foundation; either version 2
-#  of the License, or (at your option) any later version.
-#
-#  This program is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-#
-#  You should have received a copy of the GNU General Public License
-#  along with this program; if not, write to the Free Software Foundation,
-#  Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# ##### END GPL LICENSE BLOCK #####
-
-bl_info = {
-    "name": "Import Unreal Skeleton Mesh (.psk)/Animation Set (.psa) (280)",
-    "author": "Darknet, flufy3d, camg188, befzz, Luner",
-    "version": (2, 8, 3),
-    "blender": (4, 0, 0),
-    "location": "File > Import > Skeleton Mesh (.psk)/Animation Set (.psa) OR View3D > Tool Shelf (key T) > Misc. tab",
-    "description": "Import Skeleton Mesh / Animation Data",
-    "warning": "",
-    "wiki_url": "https://github.com/Befzz/blender3d_import_psk_psa",
-    "category": "Import-Export",
-    "tracker_url": "https://github.com/Befzz/blender3d_import_psk_psa/issues"
-}
-
-"""
-Version': '2.0' ported by Darknet
-
-Unreal Tournament PSK file to Blender mesh converter V1.0
-Author: D.M. Sturgeon (camg188 at the elYsium forum), ported by Darknet
-Imports a *psk file to a new mesh
-
--No UV Texutre
--No Weight
--No Armature Bones
--No Material ID
--Export Text Log From Current Location File (Bool )
-"""
-
-"""
-Version': '2.7.*' edited by befzz
-Github: https://github.com/Befzz/blender3d_import_psk_psa
-- Pskx support
-- Animation import updated (bone orientation now works)
-- Skeleton import: auto-size, auto-orient bones
-- UVmap, mesh, weights, etc. import revised
-- Extra UVs import
-
-- No Scale support. (no test material)
-- No smoothing groups (not exported by umodel)
-"""
-
-"""
-Version': '2.8.0' edited by floxay
-- Vertex normals import (VTXNORMS chunk)
-        (requires custom UEViewer build /at the moment/)
-"""
-
-"""
-Version': '2.8.1' edited by Half
-- Morph targets import (MRPHINFO and MRPHDATA chunks)
-"""
-
-"""
-Version': '2.8.2' edited by Ka1serM
-- Blender 4.1 smoothing
-"""
-
-"""
-Version': '2.8.3' edited by Luner
-- matyalatte patch and merge
-"""
-
 # https://github.com/gildor2/UModel/blob/master/Exporters/Psk.h
 
 import bpy
@@ -330,6 +251,8 @@ def pskimport(filepath,
         bToSRGB = True,
         bSmoothShade = True,
         error_callback = None):
+    
+
     '''
     Import mesh and skeleton from .psk/.pskx files
     
@@ -2028,7 +1951,7 @@ class ImportProps():
     bScaleDown : BoolProperty(
             name = "Scale down",
             description = " * Used by PSK and PSA.\n * Multiply coordinates by 0.01\n * From \"cm.\" to \"m.\"",
-            default = False,
+            default = True,
             )
     bToSRGB : BoolProperty(
             name = "sRGB vertex color",

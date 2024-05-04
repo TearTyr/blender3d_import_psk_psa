@@ -58,6 +58,11 @@ Version': '2.8.0' edited by floxay
 """
 
 """
+Version': '2.8.3' edited by Luner
+- matyalatte patch and merge
+"""
+
+"""
 Edited by matyalatte
 - Rename objects
 - Apply smooth shading
@@ -83,9 +88,9 @@ if "bpy" in locals():
         importlib.reload(export_as_fbx)
 
 bl_info = {
-    "name": "Import Unreal Skeleton Mesh (.psk)/Animation Set (.psa) (280)",
-    "author": "Darknet, flufy3d, camg188, befzz, matyalatte, Half, Ka1serM",
-    "version": (2, 8, 2),
+    "name": "Import Unreal Skeleton Mesh (.psk)/Animation Set (.psa) (283)",
+    "author":"Darknet, flufy3d, camg188, befzz, matyalatte, Half, Ka1serM, Luner",
+    "version": (2, 8, 3),
     "blender": (4, 0, 0),
     "location": "File > Import > Skeleton Mesh (.psk)/Animation Set (.psa) OR View3D > Tool Shelf (key T) > Misc. tab",
     "description": "Import Skeleton Mesh / Animation Data",
