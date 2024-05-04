@@ -267,7 +267,7 @@ def pskimport(filepath,
             
     '''
 
-    bpy.context.scene.unit_settings.scale_length=0.01
+    # bpy.context.scene.unit_settings.scale_length=0.01
 
     if not hasattr( error_callback, '__call__'):
         # error_callback = __pass
