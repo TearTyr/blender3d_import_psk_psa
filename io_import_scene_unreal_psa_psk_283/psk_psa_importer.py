@@ -2095,7 +2095,8 @@ class IMPORT_OT_psk(bpy.types.Operator, ImportProps):
                     "bUpdateTimelineRange",
                     "bRotationOnly",
                     "files", 
-                    "directory"
+                    "directory",
+                    "bSmoothShade"
                     )
                 )
                 

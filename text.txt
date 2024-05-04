@@ -1,0 +1,1990 @@
+but i found this psa exporter from a github page.
+and i'd like to make a merge with this one.
+
+io_scene_psk_psa\data.py
+from ctypes import *
+from typing import Tuple
+
+
+class Color(Structure):
+    _fields_ = [
+        ('r', c_ubyte),
+        ('g', c_ubyte),
+        ('b', c_ubyte),
+        ('a', c_ubyte),
+    ]
+
+    def __iter__(self):
+        yield self.r
+        yield self.g
+        yield self.b
+        yield self.a
+
+    def __eq__(self, other):
+        return all(map(lambda x: x[0] == x[1], zip(self, other)))
+
+    def __repr__(self):
+        return repr(tuple(self))
+
+    def normalized(self) -> Tuple:
+        return tuple(map(lambda x: x / 255.0, iter(self)))
+
+
+class Vector2(Structure):
+    _fields_ = [
+        ('x', c_float),
+        ('y', c_float),
+    ]
+
+    def __iter__(self):
+        yield self.x
+        yield self.y
+
+    def __repr__(self):
+        return repr(tuple(self))
+
+
+class Vector3(Structure):
+    _fields_ = [
+        ('x', c_float),
+        ('y', c_float),
+        ('z', c_float),
+    ]
+
+    def __iter__(self):
+        yield self.x
+        yield self.y
+        yield self.z
+
+    def __repr__(self):
+        return repr(tuple(self))
+
+    @classmethod
+    def zero(cls):
+        return Vector3(0, 0, 0)
+
+
+class Quaternion(Structure):
+    _fields_ = [
+        ('x', c_float),
+        ('y', c_float),
+        ('z', c_float),
+        ('w', c_float),
+    ]
+
+    def __iter__(self):
+        yield self.w
+        yield self.x
+        yield self.y
+        yield self.z
+
+    def __repr__(self):
+        return repr(tuple(self))
+
+    @classmethod
+    def identity(cls):
+        return Quaternion(0, 0, 0, 1)
+
+
+class Section(Structure):
+    _fields_ = [
+        ('name', c_char * 20),
+        ('type_flags', c_int32),
+        ('data_size', c_int32),
+        ('data_count', c_int32)
+    ]
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.type_flags = 1999801
+
+io_scene_psk_psa\helpers.py
+import re
+import typing
+from typing import List, Iterable
+
+import addon_utils
+import bpy.types
+from bpy.types import NlaStrip, Object, AnimData
+
+
+def rgb_to_srgb(c: float):
+    if c > 0.0031308:
+        return 1.055 * (pow(c, (1.0 / 2.4))) - 0.055
+    else:
+        return 12.92 * c
+
+
+def get_nla_strips_in_frame_range(animation_data: AnimData, frame_min: float, frame_max: float) -> List[NlaStrip]:
+    if animation_data is None:
+        return []
+    strips = []
+    for nla_track in animation_data.nla_tracks:
+        if nla_track.mute:
+            continue
+        for strip in nla_track.strips:
+            if (strip.frame_start < frame_min and strip.frame_end > frame_max) or \
+                    (frame_min <= strip.frame_start < frame_max) or \
+                    (frame_min < strip.frame_end <= frame_max):
+                strips.append(strip)
+    return strips
+
+
+def populate_bone_collection_list(armature_object: Object, bone_collection_list: bpy.props.CollectionProperty) -> None:
+    '''
+    Updates the bone collections collection.
+
+    Bone collection selections are preserved between updates unless none of the groups were previously selected;
+    otherwise, all collections are selected by default.
+    '''
+    has_selected_collections = any([g.is_selected for g in bone_collection_list])
+    unassigned_collection_is_selected, selected_assigned_collection_names = True, []
+
+    if armature_object is None:
+        return
+
+    if has_selected_collections:
+        # Preserve group selections before clearing the list.
+        # We handle selections for the unassigned group separately to cover the edge case
+        # where there might be an actual group with 'Unassigned' as its name.
+        unassigned_collection_idx, unassigned_collection_is_selected = next(iter([
+            (i, g.is_selected) for i, g in enumerate(bone_collection_list) if g.index == -1]), (-1, False))
+
+        selected_assigned_collection_names = [
+            g.name for i, g in enumerate(bone_collection_list) if i != unassigned_collection_idx and g.is_selected]
+
+    bone_collection_list.clear()
+
+    armature = armature_object.data
+
+    if armature is None:
+        return
+
+    item = bone_collection_list.add()
+    item.name = 'Unassigned'
+    item.index = -1
+    # Count the number of bones without an assigned bone collection
+    item.count = sum(map(lambda bone: 1 if len(bone.collections) == 0 else 0, armature.bones))
+    item.is_selected = unassigned_collection_is_selected
+
+    for bone_collection_index, bone_collection in enumerate(armature.collections):
+        item = bone_collection_list.add()
+        item.name = bone_collection.name
+        item.index = bone_collection_index
+        item.count = len(bone_collection.bones)
+        item.is_selected = bone_collection.name in selected_assigned_collection_names if has_selected_collections else True
+
+
+def check_bone_names(bone_names: Iterable[str]):
+    pattern = re.compile(r'^[a-zA-Z\d_\- ]+$')
+    invalid_bone_names = [x for x in bone_names if pattern.match(x) is None]
+    if len(invalid_bone_names) > 0:
+        raise RuntimeError(f'The following bone names are invalid: {invalid_bone_names}.\n'
+                           f'Bone names must only contain letters, numbers, spaces, hyphens and underscores.\n'
+                           f'You can bypass this by disabling "Enforce Bone Name Restrictions" in the export settings.')
+
+
+def get_export_bone_names(armature_object: Object, bone_filter_mode: str, bone_collection_indices: List[int]) -> List[str]:
+    '''
+    Returns a sorted list of bone indices that should be exported for the given bone filter mode and bone collections.
+
+    Note that the ancestors of bones within the bone collections will also be present in the returned list.
+
+    :param armature_object: Blender object with type 'ARMATURE'
+    :param bone_filter_mode: One of ['ALL', 'BONE_COLLECTIONS']
+    :param bone_collection_indices: List of bone collection indices to be exported.
+    :return: A sorted list of bone indices that should be exported.
+    '''
+    if armature_object is None or armature_object.type != 'ARMATURE':
+        raise ValueError('An armature object must be supplied')
+
+    armature_data = typing.cast(bpy.types.Armature, armature_object.data)
+    bones = armature_data.bones
+    bone_names = [x.name for x in bones]
+
+    # Get a list of the bone indices that we are explicitly including.
+    bone_index_stack = []
+    is_exporting_unassigned_bone_collections = -1 in bone_collection_indices
+    bone_collections = list(armature_data.collections)
+
+    for bone_index, bone in enumerate(bones):
+        # Check if this bone is in any of the collections in the bone collection indices list.
+        this_bone_collection_indices = set(bone_collections.index(x) for x in bone.collections)
+        is_in_exported_bone_collections = len(set(bone_collection_indices).intersection(this_bone_collection_indices)) > 0
+
+        if bone_filter_mode == 'ALL' or \
+                (len(bone.collections) == 0 and is_exporting_unassigned_bone_collections) or \
+                is_in_exported_bone_collections:
+            bone_index_stack.append((bone_index, None))
+
+    # For each bone that is explicitly being added, recursively walk up the hierarchy and ensure that all of
+    # those ancestor bone indices are also in the list.
+    bone_indices = dict()
+    while len(bone_index_stack) > 0:
+        bone_index, instigator_bone_index = bone_index_stack.pop()
+        bone = bones[bone_index]
+        if bone.parent is not None:
+            parent_bone_index = bone_names.index(bone.parent.name)
+            if parent_bone_index not in bone_indices:
+                bone_index_stack.append((parent_bone_index, bone_index))
+        bone_indices[bone_index] = instigator_bone_index
+
+    # Sort the bone index list in-place.
+    bone_indices = [(x[0], x[1]) for x in bone_indices.items()]
+    bone_indices.sort(key=lambda x: x[0])
+
+    # Split out the bone indices and the instigator bone names into separate lists.
+    # We use the bone names for the return values because the bone name is a more universal way of referencing them.
+    # For example, users of this function may modify bone lists, which would invalidate the indices and require an
+    # index mapping scheme to resolve it. Using strings is more comfy and results in less code downstream.
+    instigator_bone_names = [bones[x[1]].name if x[1] is not None else None for x in bone_indices]
+    bone_names = [bones[x[0]].name for x in bone_indices]
+
+    # Ensure that the hierarchy we are sending back has a single root bone.
+    bone_indices = [x[0] for x in bone_indices]
+    root_bones = [bones[bone_index] for bone_index in bone_indices if bones[bone_index].parent is None]
+    if len(root_bones) > 1:
+        # There is more than one root bone.
+        # Print out why each root bone was included by linking it to one of the explicitly included bones.
+        root_bone_names = [bone.name for bone in root_bones]
+        for root_bone_name in root_bone_names:
+            bone_name = root_bone_name
+            while True:
+                # Traverse the instigator chain until the end to find the true instigator bone.
+                # TODO: in future, it would be preferential to have a readout of *all* instigator bones.
+                instigator_bone_name = instigator_bone_names[bone_names.index(bone_name)]
+                if instigator_bone_name is None:
+                    print(f'Root bone "{root_bone_name}" was included because {bone_name} was marked for export')
+                    break
+                bone_name = instigator_bone_name
+
+        raise RuntimeError('Exported bone hierarchy must have a single root bone.\n'
+                           f'The bone hierarchy marked for export has {len(root_bones)} root bones: {root_bone_names}.\n'
+                           f'Additional debugging information has been written to the console.')
+
+    return bone_names
+
+
+def is_bdk_addon_loaded():
+    return addon_utils.check('bdk_addon')[1]
+
+io_scene_psk_psa\types.py
+from bpy.props import StringProperty, IntProperty, BoolProperty, FloatProperty
+from bpy.types import PropertyGroup, UIList, UILayout, Context, AnyType, Panel
+
+
+class PSX_UL_bone_collection_list(UIList):
+
+    def draw_item(self, context: Context, layout: UILayout, data: AnyType, item: AnyType, icon: int,
+                  active_data: AnyType, active_property: str, index: int = 0, flt_flag: int = 0):
+        row = layout.row()
+        row.prop(item, 'is_selected', text=getattr(item, 'name'))
+        row.label(text=str(getattr(item, 'count')), icon='BONE_DATA')
+
+
+class PSX_PG_bone_collection_list_item(PropertyGroup):
+    name: StringProperty()
+    index: IntProperty()
+    count: IntProperty()
+    is_selected: BoolProperty(default=False)
+
+
+class PSX_PG_action_export(PropertyGroup):
+    compression_ratio: FloatProperty(name='Compression Ratio', default=1.0, min=0.0, max=1.0, subtype='FACTOR', description='The key sampling ratio of the exported sequence.\n\nA compression ratio of 1.0 will export all frames, while a compression ratio of 0.5 will export half of the frames')
+    key_quota: IntProperty(name='Key Quota', default=0, min=1, description='The minimum number of frames to be exported')
+    fps: FloatProperty(name='FPS', default=30.0, min=0.0, description='The frame rate of the exported sequence')
+
+
+class PSX_PT_action(Panel):
+    bl_idname = 'PSX_PT_action'
+    bl_label = 'PSA Export'
+    bl_space_type = 'DOPESHEET_EDITOR'
+    bl_region_type = 'UI'
+    bl_context = 'action'
+    bl_category = 'Action'
+
+    @classmethod
+    def poll(cls, context: 'Context'):
+        return context.active_object and context.active_object.type == 'ARMATURE' and context.active_action is not None
+
+    def draw(self, context: 'Context'):
+        action = context.active_action
+        layout = self.layout
+        flow = layout.grid_flow(columns=1)
+        flow.use_property_split = True
+        flow.use_property_decorate = False
+        flow.prop(action.psa_export, 'compression_ratio')
+        flow.prop(action.psa_export, 'key_quota')
+        flow.prop(action.psa_export, 'fps')
+
+
+classes = (
+    PSX_PG_action_export,
+    PSX_PG_bone_collection_list_item,
+    PSX_UL_bone_collection_list,
+    PSX_PT_action,
+)
+
+io_scene_psk_psa\psa\builder.py
+from typing import Optional
+
+from bpy.types import Armature, Bone, Action, PoseBone
+
+from .data import *
+from ..helpers import *
+
+
+class PsaBuildSequence:
+    class NlaState:
+        def __init__(self):
+            self.action: Optional[Action] = None
+            self.frame_start: int = 0
+            self.frame_end: int = 0
+
+    def __init__(self):
+        self.name: str = ''
+        self.nla_state: PsaBuildSequence.NlaState = PsaBuildSequence.NlaState()
+        self.compression_ratio: float = 1.0
+        self.key_quota: int = 0
+        self.fps: float = 30.0
+
+
+class PsaBuildOptions:
+    def __init__(self):
+        self.animation_data: Optional[AnimData] = None
+        self.sequences: List[PsaBuildSequence] = []
+        self.bone_filter_mode: str = 'ALL'
+        self.bone_collection_indices: List[int] = []
+        self.should_enforce_bone_name_restrictions: bool = False
+        self.sequence_name_prefix: str = ''
+        self.sequence_name_suffix: str = ''
+        self.root_motion: bool = False
+
+
+def _get_pose_bone_location_and_rotation(pose_bone: PoseBone, armature_object: Object, options: PsaBuildOptions):
+    if pose_bone.parent is not None:
+        pose_bone_matrix = pose_bone.matrix
+        pose_bone_parent_matrix = pose_bone.parent.matrix
+        pose_bone_matrix = pose_bone_parent_matrix.inverted() @ pose_bone_matrix
+    else:
+        if options.root_motion:
+            # Get the bone's pose matrix, taking the armature object's world matrix into account.
+            pose_bone_matrix = armature_object.matrix_world @ pose_bone.matrix
+        else:
+            # Use the bind pose matrix for the root bone.
+            pose_bone_matrix = pose_bone.matrix
+
+    location = pose_bone_matrix.to_translation()
+    rotation = pose_bone_matrix.to_quaternion().normalized()
+
+    if pose_bone.parent is not None:
+        rotation.conjugate()
+
+    return location, rotation
+
+
+def build_psa(context: bpy.types.Context, options: PsaBuildOptions) -> Psa:
+    active_object = context.view_layer.objects.active
+
+    psa = Psa()
+
+    armature_object = active_object
+    armature_data = typing.cast(Armature, armature_object.data)
+    bones: List[Bone] = list(iter(armature_data.bones))
+
+    # The order of the armature bones and the pose bones is not guaranteed to be the same.
+    # As a result, we need to reconstruct the list of pose bones in the same order as the
+    # armature bones.
+    bone_names = [x.name for x in bones]
+    pose_bones = [(bone_names.index(bone.name), bone) for bone in armature_object.pose.bones]
+    pose_bones.sort(key=lambda x: x[0])
+    pose_bones = [x[1] for x in pose_bones]
+
+    # Get a list of all the bone indices and instigator bones for the bone filter settings.
+    export_bone_names = get_export_bone_names(armature_object, options.bone_filter_mode, options.bone_collection_indices)
+    bone_indices = [bone_names.index(x) for x in export_bone_names]
+
+    # Make the bone lists contain only the bones that are going to be exported.
+    bones = [bones[bone_index] for bone_index in bone_indices]
+    pose_bones = [pose_bones[bone_index] for bone_index in bone_indices]
+
+    # No bones are going to be exported.
+    if len(bones) == 0:
+        raise RuntimeError('No bones available for export')
+
+    # Check that all bone names are valid.
+    if options.should_enforce_bone_name_restrictions:
+        check_bone_names(map(lambda bone: bone.name, bones))
+        
+    # Build list of PSA bones.
+    for bone in bones:
+        psa_bone = Psa.Bone()
+
+        try:
+            psa_bone.name = bytes(bone.name, encoding='windows-1252')
+        except UnicodeEncodeError:
+            raise RuntimeError(f'Bone name "{bone.name}" contains characters that cannot be encoded in the Windows-1252 codepage')
+
+        try:
+            parent_index = bones.index(bone.parent)
+            psa_bone.parent_index = parent_index
+            psa.bones[parent_index].children_count += 1
+        except ValueError:
+            psa_bone.parent_index = 0
+
+        if bone.parent is not None:
+            rotation = bone.matrix.to_quaternion().conjugated()
+            inverse_parent_rotation = bone.parent.matrix.to_quaternion().inverted()
+            parent_head = inverse_parent_rotation @ bone.parent.head
+            parent_tail = inverse_parent_rotation @ bone.parent.tail
+            location = (parent_tail - parent_head) + bone.head
+        else:
+            armature_local_matrix = armature_object.matrix_local
+            location = armature_local_matrix @ bone.head
+            bone_rotation = bone.matrix.to_quaternion().conjugated()
+            local_rotation = armature_local_matrix.to_3x3().to_quaternion().conjugated()
+            rotation = bone_rotation @ local_rotation
+            rotation.conjugate()
+
+        psa_bone.location.x = location.x
+        psa_bone.location.y = location.y
+        psa_bone.location.z = location.z
+
+        psa_bone.rotation.x = rotation.x
+        psa_bone.rotation.y = rotation.y
+        psa_bone.rotation.z = rotation.z
+        psa_bone.rotation.w = rotation.w
+
+        psa.bones.append(psa_bone)
+
+    # Add prefixes and suffices to the names of the export sequences and strip whitespace.
+    for export_sequence in options.sequences:
+        export_sequence.name = f'{options.sequence_name_prefix}{export_sequence.name}{options.sequence_name_suffix}'
+        export_sequence.name = export_sequence.name.strip()
+
+    # Save the current action and frame so that we can restore the state once we are done.
+    saved_frame_current = context.scene.frame_current
+    saved_action = options.animation_data.action
+
+    # Now build the PSA sequences.
+    # We actually alter the timeline frame and simply record the resultant pose bone matrices.
+    frame_start_index = 0
+
+    context.window_manager.progress_begin(0, len(options.sequences))
+
+    for export_sequence_index, export_sequence in enumerate(options.sequences):
+        # Link the action to the animation data and update view layer.
+        options.animation_data.action = export_sequence.nla_state.action
+        context.view_layer.update()
+
+        frame_start = export_sequence.nla_state.frame_start
+        frame_end = export_sequence.nla_state.frame_end
+
+        # Calculate the frame step based on the compression factor.
+        frame_extents = abs(frame_end - frame_start)
+        frame_count_raw = frame_extents + 1
+        frame_count = max(export_sequence.key_quota, int(frame_count_raw * export_sequence.compression_ratio))
+
+        try:
+            frame_step = frame_extents / (frame_count - 1)
+        except ZeroDivisionError:
+            frame_step = 0.0
+
+        sequence_duration = frame_count_raw / export_sequence.fps
+
+        # If this is a reverse sequence, we need to reverse the frame step.
+        if frame_start > frame_end:
+            frame_step = -frame_step
+
+        psa_sequence = Psa.Sequence()
+        try:
+            psa_sequence.name = bytes(export_sequence.name, encoding='windows-1252')
+        except UnicodeEncodeError:
+            raise RuntimeError(f'Sequence name "{export_sequence.name}" contains characters that cannot be encoded in the Windows-1252 codepage')
+        psa_sequence.frame_count = frame_count
+        psa_sequence.frame_start_index = frame_start_index
+        psa_sequence.fps = frame_count / sequence_duration
+        psa_sequence.bone_count = len(pose_bones)
+        psa_sequence.track_time = frame_count
+        psa_sequence.key_reduction = 1.0
+
+        frame = float(frame_start)
+
+        for _ in range(frame_count):
+            context.scene.frame_set(frame=int(frame), subframe=frame % 1.0)
+
+            for pose_bone in pose_bones:
+                location, rotation = _get_pose_bone_location_and_rotation(pose_bone, armature_object, options)
+
+                key = Psa.Key()
+                key.location.x = location.x
+                key.location.y = location.y
+                key.location.z = location.z
+                key.rotation.x = rotation.x
+                key.rotation.y = rotation.y
+                key.rotation.z = rotation.z
+                key.rotation.w = rotation.w
+                key.time = 1.0 / psa_sequence.fps
+                psa.keys.append(key)
+
+            frame += frame_step
+
+        frame_start_index += frame_count
+
+        psa.sequences[export_sequence.name] = psa_sequence
+
+        context.window_manager.progress_update(export_sequence_index)
+
+    # Restore the previous action & frame.
+    options.animation_data.action = saved_action
+    context.scene.frame_set(saved_frame_current)
+
+    context.window_manager.progress_end()
+
+    return psa
+
+io_scene_psk_psa\psa\config.py
+import re
+from configparser import ConfigParser
+from typing import Dict
+
+from .reader import PsaReader
+
+REMOVE_TRACK_LOCATION = (1 << 0)
+REMOVE_TRACK_ROTATION = (1 << 1)
+
+
+class PsaConfig:
+    def __init__(self):
+        self.sequence_bone_flags: Dict[str, Dict[int, int]] = dict()
+
+
+def _load_config_file(file_path: str) -> ConfigParser:
+    """
+    UEViewer exports a dialect of INI files that is not compatible with Python's ConfigParser.
+    Specifically, it allows values in this format:
+
+    [Section]
+    Key1
+    Key2
+
+    This is not allowed in Python's ConfigParser, which requires a '=' character after each key name.
+    To work around this, we'll modify the file to add the '=' character after each key name if it is missing.
+    """
+    with open(file_path, 'r') as f:
+        lines = f.read().split('\n')
+
+    lines = [re.sub(r'^\s*(\w+)\s*$', r'\1=', line) for line in lines]
+
+    contents = '\n'.join(lines)
+
+    config = ConfigParser()
+    config.read_string(contents)
+
+    return config
+
+
+def _get_bone_flags_from_value(value: str) -> int:
+    match value:
+        case 'all':
+            return REMOVE_TRACK_LOCATION | REMOVE_TRACK_ROTATION
+        case 'trans':
+            return REMOVE_TRACK_LOCATION
+        case 'rot':
+            return REMOVE_TRACK_ROTATION
+        case _:
+            return 0
+
+
+def read_psa_config(psa_reader: PsaReader, file_path: str) -> PsaConfig:
+    psa_config = PsaConfig()
+
+    config = _load_config_file(file_path)
+
+    if config.has_section('RemoveTracks'):
+        for key, value in config.items('RemoveTracks'):
+            match = re.match(f'^(.+)\.(\d+)$', key)
+            sequence_name = match.group(1)
+
+            # Map the sequence name onto the actual sequence name in the PSA file.
+            try:
+                psa_sequence_names = list(psa_reader.sequences.keys())
+                lowercase_sequence_names = [sequence_name.lower() for sequence_name in psa_sequence_names]
+                sequence_name = psa_sequence_names[lowercase_sequence_names.index(sequence_name.lower())]
+            except ValueError:
+                # Sequence name is not in the PSA file.
+                continue
+
+            if sequence_name not in psa_config.sequence_bone_flags:
+                psa_config.sequence_bone_flags[sequence_name] = dict()
+
+            bone_index = int(match.group(2))
+            psa_config.sequence_bone_flags[sequence_name][bone_index] = _get_bone_flags_from_value(value)
+
+    return psa_config
+
+io_scene_psk_psa\psa\data.py
+import typing
+from collections import OrderedDict
+from typing import List
+
+from ..data import *
+
+'''
+Note that keys are not stored within the Psa object.
+Use the PsaReader::get_sequence_keys to get the keys for a sequence.
+'''
+
+
+class Psa:
+    class Bone(Structure):
+        _fields_ = [
+            ('name', c_char * 64),
+            ('flags', c_int32),
+            ('children_count', c_int32),
+            ('parent_index', c_int32),
+            ('rotation', Quaternion),
+            ('location', Vector3),
+            ('padding', c_char * 16)
+        ]
+
+    class Sequence(Structure):
+        _fields_ = [
+            ('name', c_char * 64),
+            ('group', c_char * 64),
+            ('bone_count', c_int32),
+            ('root_include', c_int32),
+            ('compression_style', c_int32),
+            ('key_quotum', c_int32),
+            ('key_reduction', c_float),
+            ('track_time', c_float),
+            ('fps', c_float),
+            ('start_bone', c_int32),
+            ('frame_start_index', c_int32),
+            ('frame_count', c_int32)
+        ]
+
+    class Key(Structure):
+        _fields_ = [
+            ('location', Vector3),
+            ('rotation', Quaternion),
+            ('time', c_float)
+        ]
+
+        @property
+        def data(self):
+            yield self.rotation.w
+            yield self.rotation.x
+            yield self.rotation.y
+            yield self.rotation.z
+            yield self.location.x
+            yield self.location.y
+            yield self.location.z
+
+        def __repr__(self) -> str:
+            return repr((self.location, self.rotation, self.time))
+
+    def __init__(self):
+        self.bones: List[Psa.Bone] = []
+        self.sequences: typing.OrderedDict[str, Psa.Sequence] = OrderedDict()
+        self.keys: List[Psa.Key] = []
+
+io_scene_psk_psa\psa\importer.py
+import typing
+from typing import List, Optional
+
+import bpy
+import numpy as np
+from bpy.types import FCurve, Object, Context
+from mathutils import Vector, Quaternion
+
+from .config import PsaConfig, REMOVE_TRACK_LOCATION, REMOVE_TRACK_ROTATION
+from .data import Psa
+from .reader import PsaReader
+
+
+class PsaImportOptions(object):
+    def __init__(self):
+        self.should_use_fake_user = False
+        self.should_stash = False
+        self.sequence_names = []
+        self.should_overwrite = False
+        self.should_write_keyframes = True
+        self.should_write_metadata = True
+        self.action_name_prefix = ''
+        self.should_convert_to_samples = False
+        self.bone_mapping_mode = 'CASE_INSENSITIVE'
+        self.fps_source = 'SEQUENCE'
+        self.fps_custom: float = 30.0
+        self.should_use_config_file = True
+        self.psa_config: PsaConfig = PsaConfig()
+
+
+class ImportBone(object):
+    def __init__(self, psa_bone: Psa.Bone):
+        self.psa_bone: Psa.Bone = psa_bone
+        self.parent: Optional[ImportBone] = None
+        self.armature_bone = None
+        self.pose_bone = None
+        self.original_location: Vector = Vector()
+        self.original_rotation: Quaternion = Quaternion()
+        self.post_rotation: Quaternion = Quaternion()
+        self.fcurves: List[FCurve] = []
+
+
+def _calculate_fcurve_data(import_bone: ImportBone, key_data: typing.Iterable[float]):
+    # Convert world-space transforms to local-space transforms.
+    key_rotation = Quaternion(key_data[0:4])
+    key_location = Vector(key_data[4:])
+    q = import_bone.post_rotation.copy()
+    q.rotate(import_bone.original_rotation)
+    rotation = q
+    q = import_bone.post_rotation.copy()
+    if import_bone.parent is None:
+        q.rotate(key_rotation.conjugated())
+    else:
+        q.rotate(key_rotation)
+    rotation.rotate(q.conjugated())
+    location = key_location - import_bone.original_location
+    location.rotate(import_bone.post_rotation.conjugated())
+    return rotation.w, rotation.x, rotation.y, rotation.z, location.x, location.y, location.z
+
+
+class PsaImportResult:
+    def __init__(self):
+        self.warnings: List[str] = []
+
+
+def _get_armature_bone_index_for_psa_bone(psa_bone_name: str, armature_bone_names: List[str], bone_mapping_mode: str = 'EXACT') -> Optional[int]:
+    """
+    @param psa_bone_name: The name of the PSA bone.
+    @param armature_bone_names: The names of the bones in the armature.
+    @param bone_mapping_mode: One of 'EXACT' or 'CASE_INSENSITIVE'.
+    @return: The index of the armature bone that corresponds to the given PSA bone, or None if no such bone exists.
+    """
+    for armature_bone_index, armature_bone_name in enumerate(armature_bone_names):
+        if bone_mapping_mode == 'CASE_INSENSITIVE':
+            if armature_bone_name.lower() == psa_bone_name.lower():
+                return armature_bone_index
+        else:
+            if armature_bone_name == psa_bone_name:
+                return armature_bone_index
+    return None
+
+def _get_sample_frame_times(source_frame_count: int, frame_step: float) -> typing.Iterable[float]:
+    # TODO: for correctness, we should also emit the target frame time as well (because the last frame can be a
+    #  fractional frame).
+    time = 0.0
+    while time < source_frame_count - 1:
+        yield time
+        time += frame_step
+    yield source_frame_count - 1
+
+def _resample_sequence_data_matrix(sequence_data_matrix: np.ndarray, frame_step: float = 1.0) -> np.ndarray:
+    """
+    Resamples the sequence data matrix to the target frame count.
+    @param sequence_data_matrix: FxBx7 matrix where F is the number of frames, B is the number of bones, and X is the
+    number of data elements per bone.
+    @param frame_step: The step between frames in the resampled sequence.
+    @return: The resampled sequence data matrix, or sequence_data_matrix if no resampling is necessary.
+    """
+    if frame_step == 1.0:
+        # No resampling is necessary.
+        return sequence_data_matrix
+
+    source_frame_count, bone_count = sequence_data_matrix.shape[:2]
+    sample_frame_times = list(_get_sample_frame_times(source_frame_count, frame_step))
+    target_frame_count = len(sample_frame_times)
+    resampled_sequence_data_matrix = np.zeros((target_frame_count, bone_count, 7), dtype=float)
+
+    for sample_frame_index, sample_frame_time in enumerate(sample_frame_times):
+        frame_index = int(sample_frame_time)
+        if sample_frame_time % 1.0 == 0.0:
+            # Sample time has no fractional part, so just copy the frame.
+            resampled_sequence_data_matrix[sample_frame_index, :, :] = sequence_data_matrix[frame_index, :, :]
+        else:
+            # Sample time has a fractional part, so interpolate between two frames.
+            next_frame_index = frame_index + 1
+            for bone_index in range(bone_count):
+                source_frame_1_data = sequence_data_matrix[frame_index, bone_index, :]
+                source_frame_2_data = sequence_data_matrix[next_frame_index, bone_index, :]
+                factor = sample_frame_time - frame_index
+                q = Quaternion((source_frame_1_data[:4])).slerp(Quaternion((source_frame_2_data[:4])), factor)
+                q.normalize()
+                l = Vector(source_frame_1_data[4:]).lerp(Vector(source_frame_2_data[4:]), factor)
+                resampled_sequence_data_matrix[sample_frame_index, bone_index, :] = q.w, q.x, q.y, q.z, l.x, l.y, l.z
+
+    return resampled_sequence_data_matrix
+
+
+def import_psa(context: Context, psa_reader: PsaReader, armature_object: Object, options: PsaImportOptions) -> PsaImportResult:
+    result = PsaImportResult()
+    sequences = [psa_reader.sequences[x] for x in options.sequence_names]
+    armature_data = typing.cast(bpy.types.Armature, armature_object.data)
+
+    # Create an index mapping from bones in the PSA to bones in the target armature.
+    psa_to_armature_bone_indices = {}
+    armature_to_psa_bone_indices = {}
+    armature_bone_names = [x.name for x in armature_data.bones]
+    psa_bone_names = []
+    duplicate_mappings = []
+
+    for psa_bone_index, psa_bone in enumerate(psa_reader.bones):
+        psa_bone_name: str = psa_bone.name.decode('windows-1252')
+        armature_bone_index = _get_armature_bone_index_for_psa_bone(psa_bone_name, armature_bone_names, options.bone_mapping_mode)
+        if armature_bone_index is not None:
+            # Ensure that no other PSA bone has been mapped to this armature bone yet.
+            if armature_bone_index not in armature_to_psa_bone_indices:
+                psa_to_armature_bone_indices[psa_bone_index] = armature_bone_index
+                armature_to_psa_bone_indices[armature_bone_index] = psa_bone_index
+            else:
+                # This armature bone has already been mapped to a PSA bone.
+                duplicate_mappings.append((psa_bone_index, armature_bone_index, armature_to_psa_bone_indices[armature_bone_index]))
+            psa_bone_names.append(armature_bone_names[armature_bone_index])
+        else:
+            psa_bone_names.append(psa_bone_name)
+
+    # Warn about duplicate bone mappings.
+    if len(duplicate_mappings) > 0:
+        for (psa_bone_index, armature_bone_index, mapped_psa_bone_index) in duplicate_mappings:
+            psa_bone_name = psa_bone_names[psa_bone_index]
+            armature_bone_name = armature_bone_names[armature_bone_index]
+            mapped_psa_bone_name = psa_bone_names[mapped_psa_bone_index]
+            result.warnings.append(f'PSA bone {psa_bone_index} ({psa_bone_name}) could not be mapped to armature bone {armature_bone_index} ({armature_bone_name}) because the armature bone is already mapped to PSA bone {mapped_psa_bone_index} ({mapped_psa_bone_name})')
+
+    # Report if there are missing bones in the target armature.
+    missing_bone_names = set(psa_bone_names).difference(set(armature_bone_names))
+    if len(missing_bone_names) > 0:
+        result.warnings.append(
+            f'The armature \'{armature_object.name}\' is missing {len(missing_bone_names)} bones that exist in '
+            'the PSA:\n' +
+            str(list(sorted(missing_bone_names)))
+        )
+    del armature_bone_names
+
+    # Create intermediate bone data for import operations.
+    import_bones = []
+    psa_bone_names_to_import_bones = dict()
+
+    for (psa_bone_index, psa_bone), psa_bone_name in zip(enumerate(psa_reader.bones), psa_bone_names):
+        if psa_bone_index not in psa_to_armature_bone_indices:
+            # PSA bone does not map to armature bone, skip it and leave an empty bone in its place.
+            import_bones.append(None)
+            continue
+        import_bone = ImportBone(psa_bone)
+        import_bone.armature_bone = armature_data.bones[psa_bone_name]
+        import_bone.pose_bone = armature_object.pose.bones[psa_bone_name]
+        psa_bone_names_to_import_bones[psa_bone_name] = import_bone
+        import_bones.append(import_bone)
+
+    bones_with_missing_parents = []
+
+    for import_bone in filter(lambda x: x is not None, import_bones):
+        armature_bone = import_bone.armature_bone
+        has_parent = armature_bone.parent is not None
+        if has_parent:
+            if armature_bone.parent.name in psa_bone_names:
+                import_bone.parent = psa_bone_names_to_import_bones[armature_bone.parent.name]
+            else:
+                # Add a warning if the parent bone is not in the PSA.
+                bones_with_missing_parents.append(armature_bone)
+        # Calculate the original location & rotation of each bone (in world-space maybe?)
+        if has_parent:
+            import_bone.original_location = armature_bone.matrix_local.translation - armature_bone.parent.matrix_local.translation
+            import_bone.original_location.rotate(armature_bone.parent.matrix_local.to_quaternion().conjugated())
+            import_bone.original_rotation = armature_bone.matrix_local.to_quaternion()
+            import_bone.original_rotation.rotate(armature_bone.parent.matrix_local.to_quaternion().conjugated())
+            import_bone.original_rotation.conjugate()
+        else:
+            import_bone.original_location = armature_bone.matrix_local.translation.copy()
+            import_bone.original_rotation = armature_bone.matrix_local.to_quaternion().conjugated()
+
+        import_bone.post_rotation = import_bone.original_rotation.conjugated()
+
+    # Warn about bones with missing parents.
+    if len(bones_with_missing_parents) > 0:
+        count = len(bones_with_missing_parents)
+        message = f'{count} bone(s) have parents that are not present in the PSA:\n' + str([x.name for x in bones_with_missing_parents])
+        result.warnings.append(message)
+
+    context.window_manager.progress_begin(0, len(sequences))
+
+    # Create and populate the data for new sequences.
+    actions = []
+    for sequence_index, sequence in enumerate(sequences):
+        # Add the action.
+        sequence_name = sequence.name.decode('windows-1252')
+        action_name = options.action_name_prefix + sequence_name
+
+        # Get the bone track flags for this sequence, or an empty dictionary if none exist.
+        sequence_bone_track_flags = dict()
+        if sequence_name in options.psa_config.sequence_bone_flags.keys():
+            sequence_bone_track_flags = options.psa_config.sequence_bone_flags[sequence_name]
+
+        if options.should_overwrite and action_name in bpy.data.actions:
+            action = bpy.data.actions[action_name]
+        else:
+            action = bpy.data.actions.new(name=action_name)
+
+        # Calculate the target FPS.
+        match options.fps_source:
+            case 'CUSTOM':
+                target_fps = options.fps_custom
+            case 'SCENE':
+                target_fps = context.scene.render.fps
+            case 'SEQUENCE':
+                target_fps = sequence.fps
+            case _:
+                raise ValueError(f'Unknown FPS source: {options.fps_source}')
+
+        if options.should_write_keyframes:
+            # Remove existing f-curves.
+            action.fcurves.clear()
+
+            # Create f-curves for the rotation and location of each bone.
+            for psa_bone_index, armature_bone_index in psa_to_armature_bone_indices.items():
+                bone_track_flags = sequence_bone_track_flags.get(psa_bone_index, 0)
+                import_bone = import_bones[psa_bone_index]
+                pose_bone = import_bone.pose_bone
+                rotation_data_path = pose_bone.path_from_id('rotation_quaternion')
+                location_data_path = pose_bone.path_from_id('location')
+                add_rotation_fcurves = (bone_track_flags & REMOVE_TRACK_ROTATION) == 0
+                add_location_fcurves = (bone_track_flags & REMOVE_TRACK_LOCATION) == 0
+                import_bone.fcurves = [
+                    action.fcurves.new(rotation_data_path, index=0, action_group=pose_bone.name) if add_rotation_fcurves else None,  # Qw
+                    action.fcurves.new(rotation_data_path, index=1, action_group=pose_bone.name) if add_rotation_fcurves else None,  # Qx
+                    action.fcurves.new(rotation_data_path, index=2, action_group=pose_bone.name) if add_rotation_fcurves else None,  # Qy
+                    action.fcurves.new(rotation_data_path, index=3, action_group=pose_bone.name) if add_rotation_fcurves else None,  # Qz
+                    action.fcurves.new(location_data_path, index=0, action_group=pose_bone.name) if add_location_fcurves else None,  # Lx
+                    action.fcurves.new(location_data_path, index=1, action_group=pose_bone.name) if add_location_fcurves else None,  # Ly
+                    action.fcurves.new(location_data_path, index=2, action_group=pose_bone.name) if add_location_fcurves else None,  # Lz
+                ]
+
+            # Read the sequence data matrix from the PSA.
+            sequence_data_matrix = psa_reader.read_sequence_data_matrix(sequence_name)
+
+            # Convert the sequence's data from world-space to local-space.
+            for bone_index, import_bone in enumerate(import_bones):
+                if import_bone is None:
+                    continue
+                for frame_index in range(sequence.frame_count):
+                    # This bone has writeable keyframes for this frame.
+                    key_data = sequence_data_matrix[frame_index, bone_index]
+                    # Calculate the local-space key data for the bone.
+                    sequence_data_matrix[frame_index, bone_index] = _calculate_fcurve_data(import_bone, key_data)
+
+            # Resample the sequence data to the target FPS.
+            # If the target frame count is the same as the source frame count, this will be a no-op.
+            resampled_sequence_data_matrix = _resample_sequence_data_matrix(sequence_data_matrix,
+                                                                            frame_step=sequence.fps / target_fps)
+
+            # Write the keyframes out.
+            # Note that the f-curve data consists of alternating time and value data.
+            target_frame_count = resampled_sequence_data_matrix.shape[0]
+            fcurve_data = np.zeros(2 * target_frame_count, dtype=float)
+            fcurve_data[0::2] = range(0, target_frame_count)
+
+            for bone_index, import_bone in enumerate(import_bones):
+                if import_bone is None:
+                    continue
+                for fcurve_index, fcurve in enumerate(import_bone.fcurves):
+                    if fcurve is None:
+                        continue
+                    fcurve_data[1::2] = resampled_sequence_data_matrix[:, bone_index, fcurve_index]
+                    fcurve.keyframe_points.add(target_frame_count)
+                    fcurve.keyframe_points.foreach_set('co', fcurve_data)
+                    for fcurve_keyframe in fcurve.keyframe_points:
+                        fcurve_keyframe.interpolation = 'LINEAR'
+
+            if options.should_convert_to_samples:
+                # Bake the curve to samples.
+                for fcurve in action.fcurves:
+                    fcurve.convert_to_samples(start=0, end=sequence.frame_count)
+
+        # Write meta-data.
+        if options.should_write_metadata:
+            action.psa_export.fps = target_fps
+
+        action.use_fake_user = options.should_use_fake_user
+
+        actions.append(action)
+
+        context.window_manager.progress_update(sequence_index)
+
+    # If the user specifies, store the new animations as strips on a non-contributing NLA track.
+    if options.should_stash:
+        if armature_object.animation_data is None:
+            armature_object.animation_data_create()
+        for action in actions:
+            nla_track = armature_object.animation_data.nla_tracks.new()
+            nla_track.name = action.name
+            nla_track.mute = True
+            nla_track.strips.new(name=action.name, start=0, action=action)
+
+    context.window_manager.progress_end()
+
+    return result
+
+io_scene_psk_psa\psa\reader.py
+import ctypes
+
+import numpy as np
+
+from .data import *
+
+
+def _try_fix_cue4parse_issue_103(sequences) -> bool:
+    # Detect if the file was exported from CUE4Parse prior to the fix for issue #103.
+    # https://github.com/FabianFG/CUE4Parse/issues/103
+    # The issue was that the frame_start_index was not being set correctly, and was always being set to the same value
+    # as the frame_count.
+    # This fix will eventually be deprecated as it is only necessary for files exported prior to the fix.
+    if len(sequences) > 0 and sequences[0].frame_start_index == sequences[0].frame_count:
+        # Manually set the frame_start_index for each sequence. This assumes that the sequences are in order with
+        # no shared frames between sequences (all exporters that I know of do this, so it's a safe assumption).
+        frame_start_index = 0
+        for i, sequence in enumerate(sequences):
+            sequence.frame_start_index = frame_start_index
+            frame_start_index += sequence.frame_count
+        return True
+    return False
+
+
+class PsaReader(object):
+    """
+    This class reads the sequences and bone information immediately upon instantiation and holds onto a file handle.
+    The keyframe data is not read into memory upon instantiation due to its potentially very large size.
+    To read the key data for a particular sequence, call :read_sequence_keys.
+    """
+
+    def __init__(self, path):
+        self.keys_data_offset: int = 0
+        self.fp = open(path, 'rb')
+        self.psa: Psa = self._read(self.fp)
+
+    @property
+    def bones(self):
+        return self.psa.bones
+
+    @property
+    def sequences(self):
+        return self.psa.sequences
+
+    def read_sequence_data_matrix(self, sequence_name: str) -> np.ndarray:
+        """
+        Reads and returns the data matrix for the given sequence.
+        @param sequence_name: The name of the sequence.
+        @return: An FxBx7 matrix where F is the number of frames, B is the number of bones.
+        """
+        sequence = self.psa.sequences[sequence_name]
+        keys = self.read_sequence_keys(sequence_name)
+        bone_count = len(self.bones)
+        matrix_size = sequence.frame_count, bone_count, 7
+        matrix = np.zeros(matrix_size)
+        keys_iter = iter(keys)
+        for frame_index in range(sequence.frame_count):
+            for bone_index in range(bone_count):
+                matrix[frame_index, bone_index, :] = list(next(keys_iter).data)
+        return matrix
+
+    def read_sequence_keys(self, sequence_name: str) -> List[Psa.Key]:
+        """
+        Reads and returns the key data for a sequence.
+
+        @param sequence_name: The name of the sequence.
+        @return: A list of Psa.Keys.
+        """
+        # Set the file reader to the beginning of the keys data
+        sequence = self.psa.sequences[sequence_name]
+        data_size = sizeof(Psa.Key)
+        bone_count = len(self.psa.bones)
+        buffer_length = data_size * bone_count * sequence.frame_count
+        sequence_keys_offset = self.keys_data_offset + (sequence.frame_start_index * bone_count * data_size)
+        self.fp.seek(sequence_keys_offset, 0)
+        buffer = self.fp.read(buffer_length)
+        offset = 0
+        keys = []
+        for _ in range(sequence.frame_count * bone_count):
+            key = Psa.Key.from_buffer_copy(buffer, offset)
+            keys.append(key)
+            offset += data_size
+        return keys
+
+    @staticmethod
+    def _read_types(fp, data_class, section: Section, data):
+        buffer_length = section.data_size * section.data_count
+        buffer = fp.read(buffer_length)
+        offset = 0
+        for _ in range(section.data_count):
+            data.append(data_class.from_buffer_copy(buffer, offset))
+            offset += section.data_size
+
+    def _read(self, fp) -> Psa:
+        psa = Psa()
+        while fp.read(1):
+            fp.seek(-1, 1)
+            section = Section.from_buffer_copy(fp.read(ctypes.sizeof(Section)))
+            if section.name == b'ANIMHEAD':
+                pass
+            elif section.name == b'BONENAMES':
+                PsaReader._read_types(fp, Psa.Bone, section, psa.bones)
+            elif section.name == b'ANIMINFO':
+                sequences = []
+                PsaReader._read_types(fp, Psa.Sequence, section, sequences)
+                # Try to fix CUE4Parse bug, if necessary.
+                _try_fix_cue4parse_issue_103(sequences)
+                for sequence in sequences:
+                    psa.sequences[sequence.name.decode()] = sequence
+            elif section.name == b'ANIMKEYS':
+                # Skip keys on this pass. We will keep this file open and read from it as needed.
+                self.keys_data_offset = fp.tell()
+                fp.seek(section.data_size * section.data_count, 1)
+            else:
+                fp.seek(section.data_size * section.data_count, 1)
+                print(f'Unrecognized section in PSA: "{section.name}"')
+        return psa
+
+io_scene_psk_psa\psa\writer.py
+from ctypes import Structure, sizeof
+from typing import Type
+
+from .data import Psa
+from ..data import Section
+
+
+def write_section(fp, name: bytes, data_type: Type[Structure] = None, data: list = None):
+    section = Section()
+    section.name = name
+    if data_type is not None and data is not None:
+        section.data_size = sizeof(data_type)
+        section.data_count = len(data)
+    fp.write(section)
+    if data is not None:
+        for datum in data:
+            fp.write(datum)
+
+
+def write_psa(psa: Psa, path: str):
+    with open(path, 'wb') as fp:
+        write_section(fp, b'ANIMHEAD')
+        write_section(fp, b'BONENAMES', Psa.Bone, psa.bones)
+        write_section(fp, b'ANIMINFO', Psa.Sequence, list(psa.sequences.values()))
+        write_section(fp, b'ANIMKEYS', Psa.Key, psa.keys)
+
+io_scene_psk_psa\psa\export\operators.py
+import re
+from collections import Counter
+from typing import List, Iterable, Dict, Tuple
+
+import bpy
+from bpy.props import StringProperty
+from bpy.types import Context, Armature, Action, Object, AnimData, TimelineMarker
+from bpy_extras.io_utils import ExportHelper
+from bpy_types import Operator
+
+from .properties import PSA_PG_export, PSA_PG_export_action_list_item, filter_sequences
+from ..builder import build_psa, PsaBuildSequence, PsaBuildOptions
+from ..writer import write_psa
+from ...helpers import populate_bone_collection_list, get_nla_strips_in_frame_range
+
+
+def is_action_for_armature(armature: Armature, action: Action):
+    if len(action.fcurves) == 0:
+        return False
+    bone_names = set([x.name for x in armature.bones])
+    for fcurve in action.fcurves:
+        match = re.match(r'pose\.bones\[\"([^\"]+)\"](\[\"([^\"]+)\"])?', fcurve.data_path)
+        if not match:
+            continue
+        bone_name = match.group(1)
+        if bone_name in bone_names:
+            return True
+    return False
+
+
+def update_actions_and_timeline_markers(context: Context, armature: Armature):
+    pg = getattr(context.scene, 'psa_export')
+
+    # Clear actions and markers.
+    pg.action_list.clear()
+    pg.marker_list.clear()
+
+    # Get animation data.
+    animation_data_object = get_animation_data_object(context)
+    animation_data = animation_data_object.animation_data if animation_data_object else None
+
+    if animation_data is None:
+        return
+
+    # Populate actions list.
+    for action in bpy.data.actions:
+        if not is_action_for_armature(armature, action):
+            continue
+
+        if action.name != '' and not action.name.startswith('#'):
+            for (name, frame_start, frame_end) in get_sequences_from_action(action):
+                item = pg.action_list.add()
+                item.action = action
+                item.name = name
+                item.is_selected = False
+                item.is_pose_marker = False
+                item.frame_start = frame_start
+                item.frame_end = frame_end
+
+        # Pose markers are not guaranteed to be in frame-order, so make sure that they are.
+        pose_markers = sorted(action.pose_markers, key=lambda x: x.frame)
+        for pose_marker_index, pose_marker in enumerate(pose_markers):
+            if pose_marker.name.strip() == '' or pose_marker.name.startswith('#'):
+                continue
+            for (name, frame_start, frame_end) in get_sequences_from_action_pose_markers(action, pose_markers, pose_marker, pose_marker_index):
+                item = pg.action_list.add()
+                item.action = action
+                item.name = name
+                item.is_selected = False
+                item.is_pose_marker = True
+                item.frame_start = frame_start
+                item.frame_end = frame_end
+
+    # Populate timeline markers list.
+    marker_names = [x.name for x in context.scene.timeline_markers]
+    sequence_frame_ranges = get_timeline_marker_sequence_frame_ranges(animation_data, context, marker_names)
+
+    for marker_name in marker_names:
+        if marker_name not in sequence_frame_ranges:
+            continue
+        if marker_name.strip() == '' or marker_name.startswith('#'):
+            continue
+        frame_start, frame_end = sequence_frame_ranges[marker_name]
+        sequences = get_sequences_from_name_and_frame_range(marker_name, frame_start, frame_end)
+        for (sequence_name, frame_start, frame_end) in sequences:
+            item = pg.marker_list.add()
+            item.name = sequence_name
+            item.is_selected = False
+            item.frame_start = frame_start
+            item.frame_end = frame_end
+
+
+def get_sequence_fps(context: Context, fps_source: str, fps_custom: float, actions: Iterable[Action]) -> float:
+    match fps_source:
+        case 'SCENE':
+            return context.scene.render.fps
+        case 'CUSTOM':
+            return fps_custom
+        case 'ACTION_METADATA':
+            # Get the minimum value of action metadata FPS values.
+            return min([action.psa_export.fps for action in actions])
+        case _:
+            raise RuntimeError(f'Invalid FPS source "{fps_source}"')
+
+
+def get_animation_data_object(context: Context) -> Object:
+    pg: PSA_PG_export = getattr(context.scene, 'psa_export')
+
+    active_object = context.view_layer.objects.active
+
+    if active_object.type != 'ARMATURE':
+        raise RuntimeError('Selected object must be an Armature')
+
+    if pg.sequence_source != 'ACTIONS' and pg.should_override_animation_data:
+        animation_data_object = pg.animation_data_override
+    else:
+        animation_data_object = active_object
+
+    return animation_data_object
+
+
+def is_bone_filter_mode_item_available(context, identifier):
+    if identifier == 'BONE_COLLECTIONS':
+        armature = context.active_object.data
+        if len(armature.collections) == 0:
+            return False
+    return True
+
+
+def get_timeline_marker_sequence_frame_ranges(animation_data: AnimData, context: Context, marker_names: List[str]) -> Dict:
+    # Timeline markers need to be sorted so that we can determine the sequence start and end positions.
+    sequence_frame_ranges = dict()
+    sorted_timeline_markers = list(sorted(context.scene.timeline_markers, key=lambda x: x.frame))
+    sorted_timeline_marker_names = list(map(lambda x: x.name, sorted_timeline_markers))
+
+    for marker_name in marker_names:
+        marker = context.scene.timeline_markers[marker_name]
+        frame_start = marker.frame
+        # Determine the final frame of the sequence based on the next marker.
+        # If no subsequent marker exists, use the maximum frame_end from all NLA strips.
+        marker_index = sorted_timeline_marker_names.index(marker_name)
+        next_marker_index = marker_index + 1
+        frame_end = 0
+        if next_marker_index < len(sorted_timeline_markers):
+            # There is a next marker. Use that next marker's frame position as the last frame of this sequence.
+            frame_end = sorted_timeline_markers[next_marker_index].frame
+            nla_strips = get_nla_strips_in_frame_range(animation_data, marker.frame, frame_end)
+            if len(nla_strips) > 0:
+                frame_end = min(frame_end, max(map(lambda nla_strip: nla_strip.frame_end, nla_strips)))
+                frame_start = max(frame_start, min(map(lambda nla_strip: nla_strip.frame_start, nla_strips)))
+            else:
+                # No strips in between this marker and the next, just export this as a one-frame animation.
+                frame_end = frame_start
+        else:
+            # There is no next marker.
+            # Find the final frame of all the NLA strips and use that as the last frame of this sequence.
+            for nla_track in animation_data.nla_tracks:
+                if nla_track.mute:
+                    continue
+                for strip in nla_track.strips:
+                    frame_end = max(frame_end, strip.frame_end)
+
+        if frame_start > frame_end:
+            continue
+
+        sequence_frame_ranges[marker_name] = int(frame_start), int(frame_end)
+
+    return sequence_frame_ranges
+
+
+def get_sequences_from_name_and_frame_range(name: str, frame_start: int, frame_end: int) -> List[Tuple[str, int, int]]:
+    reversed_pattern = r'(.+)/(.+)'
+    reversed_match = re.match(reversed_pattern, name)
+    if reversed_match:
+        forward_name = reversed_match.group(1)
+        backwards_name = reversed_match.group(2)
+        return [
+            (forward_name, frame_start, frame_end),
+            (backwards_name, frame_end, frame_start)
+        ]
+    else:
+        return [(name, frame_start, frame_end)]
+
+
+def get_sequences_from_action(action: Action) -> List[Tuple[str, int, int]]:
+    frame_start = int(action.frame_range[0])
+    frame_end = int(action.frame_range[1])
+    return get_sequences_from_name_and_frame_range(action.name, frame_start, frame_end)
+
+
+def get_sequences_from_action_pose_markers(action: Action, pose_markers: List[TimelineMarker], pose_marker: TimelineMarker, pose_marker_index: int) -> List[Tuple[str, int, int]]:
+    frame_start = pose_marker.frame
+    sequence_name = pose_marker.name
+    if pose_marker.name.startswith('!'):
+        # If the pose marker name starts with an exclamation mark, only export the first frame.
+        frame_end = frame_start
+        sequence_name = sequence_name[1:]
+    elif pose_marker_index + 1 < len(pose_markers):
+        frame_end = pose_markers[pose_marker_index + 1].frame
+    else:
+        frame_end = int(action.frame_range[1])
+    return get_sequences_from_name_and_frame_range(sequence_name, frame_start, frame_end)
+
+
+def get_visible_sequences(pg: PSA_PG_export, sequences) -> List[PSA_PG_export_action_list_item]:
+    visible_sequences = []
+    for i, flag in enumerate(filter_sequences(pg, sequences)):
+        if bool(flag & (1 << 30)):
+            visible_sequences.append(sequences[i])
+    return visible_sequences
+
+
+class PSA_OT_export(Operator, ExportHelper):
+    bl_idname = 'psa_export.operator'
+    bl_label = 'Export'
+    bl_options = {'INTERNAL', 'UNDO'}
+    __doc__ = 'Export actions to PSA'
+    filename_ext = '.psa'
+    filter_glob: StringProperty(default='*.psa', options={'HIDDEN'})
+    filepath: StringProperty(
+        name='File Path',
+        description='File path used for exporting the PSA file',
+        maxlen=1024,
+        default='')
+
+    def __init__(self):
+        self.armature_object = None
+
+    @classmethod
+    def poll(cls, context):
+        try:
+            cls._check_context(context)
+        except RuntimeError as e:
+            cls.poll_message_set(str(e))
+            return False
+        return True
+
+    def draw(self, context):
+        layout = self.layout
+        pg = getattr(context.scene, 'psa_export')
+
+        # FPS
+        layout.prop(pg, 'fps_source', text='FPS')
+        if pg.fps_source == 'CUSTOM':
+            layout.prop(pg, 'fps_custom', text='Custom')
+
+        # SOURCE
+        layout.prop(pg, 'sequence_source', text='Source')
+
+        if pg.sequence_source in {'TIMELINE_MARKERS', 'NLA_TRACK_STRIPS'}:
+            # ANIMDATA SOURCE
+            layout.prop(pg, 'should_override_animation_data')
+            if pg.should_override_animation_data:
+                layout.prop(pg, 'animation_data_override', text='')
+
+        if pg.sequence_source == 'NLA_TRACK_STRIPS':
+            flow = layout.grid_flow()
+            flow.use_property_split = True
+            flow.use_property_decorate = False
+            flow.prop(pg, 'nla_track')
+
+        # SELECT ALL/NONE
+        row = layout.row(align=True)
+        row.label(text='Select')
+        row.operator(PSA_OT_export_actions_select_all.bl_idname, text='All', icon='CHECKBOX_HLT')
+        row.operator(PSA_OT_export_actions_deselect_all.bl_idname, text='None', icon='CHECKBOX_DEHLT')
+
+        # ACTIONS
+        if pg.sequence_source == 'ACTIONS':
+            rows = max(3, min(len(pg.action_list), 10))
+            layout.template_list('PSA_UL_export_sequences', '', pg, 'action_list', pg, 'action_list_index', rows=rows)
+        elif pg.sequence_source == 'TIMELINE_MARKERS':
+            rows = max(3, min(len(pg.marker_list), 10))
+            layout.template_list('PSA_UL_export_sequences', '', pg, 'marker_list', pg, 'marker_list_index', rows=rows)
+        elif pg.sequence_source == 'NLA_TRACK_STRIPS':
+            rows = max(3, min(len(pg.nla_strip_list), 10))
+            layout.template_list('PSA_UL_export_sequences', '', pg, 'nla_strip_list', pg, 'nla_strip_list_index', rows=rows)
+
+        col = layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(pg, 'sequence_name_prefix')
+        col.prop(pg, 'sequence_name_suffix')
+
+        # Determine if there is going to be a naming conflict and display an error, if so.
+        selected_items = [x for x in pg.action_list if x.is_selected]
+        action_names = [x.name for x in selected_items]
+        action_name_counts = Counter(action_names)
+        for action_name, count in action_name_counts.items():
+            if count > 1:
+                layout.label(text=f'Duplicate action: {action_name}', icon='ERROR')
+                break
+
+        layout.separator()
+
+        # BONES
+        row = layout.row(align=True)
+        row.prop(pg, 'bone_filter_mode', text='Bones')
+
+        if pg.bone_filter_mode == 'BONE_COLLECTIONS':
+            row = layout.row(align=True)
+            row.label(text='Select')
+            row.operator(PSA_OT_export_bone_collections_select_all.bl_idname, text='All', icon='CHECKBOX_HLT')
+            row.operator(PSA_OT_export_bone_collections_deselect_all.bl_idname, text='None', icon='CHECKBOX_DEHLT')
+            rows = max(3, min(len(pg.bone_collection_list), 10))
+            layout.template_list('PSX_UL_bone_collection_list', '', pg, 'bone_collection_list', pg, 'bone_collection_list_index',
+                                 rows=rows)
+
+        layout.prop(pg, 'should_enforce_bone_name_restrictions')
+
+        layout.separator()
+
+        # ROOT MOTION
+        layout.prop(pg, 'root_motion', text='Root Motion')
+
+    @classmethod
+    def _check_context(cls, context):
+        if context.view_layer.objects.active is None:
+            raise RuntimeError('An armature must be selected')
+
+        if context.view_layer.objects.active.type != 'ARMATURE':
+            raise RuntimeError('The selected object must be an armature')
+
+    def invoke(self, context, _event):
+        try:
+            self._check_context(context)
+        except RuntimeError as e:
+            self.report({'ERROR_INVALID_CONTEXT'}, str(e))
+
+        pg: PSA_PG_export = getattr(context.scene, 'psa_export')
+
+        self.armature_object = context.view_layer.objects.active
+
+        if self.armature_object.animation_data is None:
+            # This is required otherwise the action list will be empty if the armature has never had its animation
+            # data created before (i.e. if no action was ever assigned to it).
+            self.armature_object.animation_data_create()
+
+        update_actions_and_timeline_markers(context, self.armature_object.data)
+
+        populate_bone_collection_list(self.armature_object, pg.bone_collection_list)
+
+        context.window_manager.fileselect_add(self)
+
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        pg = getattr(context.scene, 'psa_export')
+
+        # Ensure that we actually have items that we are going to be exporting.
+        if pg.sequence_source == 'ACTIONS' and len(pg.action_list) == 0:
+            raise RuntimeError('No actions were selected for export')
+        elif pg.sequence_source == 'TIMELINE_MARKERS' and len(pg.marker_list) == 0:
+            raise RuntimeError('No timeline markers were selected for export')
+        elif pg.sequence_source == 'NLA_TRACK_STRIPS' and len(pg.nla_strip_list) == 0:
+            raise RuntimeError('No NLA track strips were selected for export')
+
+        # Populate the export sequence list.
+        animation_data_object = get_animation_data_object(context)
+        animation_data = animation_data_object.animation_data
+
+        if animation_data is None:
+            raise RuntimeError(f'No animation data for object \'{animation_data_object.name}\'')
+
+        export_sequences: List[PsaBuildSequence] = []
+
+        if pg.sequence_source == 'ACTIONS':
+            for action_item in filter(lambda x: x.is_selected, pg.action_list):
+                if len(action_item.action.fcurves) == 0:
+                    continue
+                export_sequence = PsaBuildSequence()
+                export_sequence.nla_state.action = action_item.action
+                export_sequence.name = action_item.name
+                export_sequence.nla_state.frame_start = action_item.frame_start
+                export_sequence.nla_state.frame_end = action_item.frame_end
+                export_sequence.fps = get_sequence_fps(context, pg.fps_source, pg.fps_custom, [action_item.action])
+                export_sequence.compression_ratio = action_item.action.psa_export.compression_ratio
+                export_sequence.key_quota = action_item.action.psa_export.key_quota
+                export_sequences.append(export_sequence)
+        elif pg.sequence_source == 'TIMELINE_MARKERS':
+            for marker_item in filter(lambda x: x.is_selected, pg.marker_list):
+                export_sequence = PsaBuildSequence()
+                export_sequence.name = marker_item.name
+                export_sequence.nla_state.action = None
+                export_sequence.nla_state.frame_start = marker_item.frame_start
+                export_sequence.nla_state.frame_end = marker_item.frame_end
+                nla_strips_actions = set(
+                    map(lambda x: x.action, get_nla_strips_in_frame_range(animation_data, marker_item.frame_start, marker_item.frame_end)))
+                export_sequence.fps = get_sequence_fps(context, pg.fps_source, pg.fps_custom, nla_strips_actions)
+                export_sequences.append(export_sequence)
+        elif pg.sequence_source == 'NLA_TRACK_STRIPS':
+            for nla_strip_item in filter(lambda x: x.is_selected, pg.nla_strip_list):
+                export_sequence = PsaBuildSequence()
+                export_sequence.name = nla_strip_item.name
+                export_sequence.nla_state.action = None
+                export_sequence.nla_state.frame_start = nla_strip_item.frame_start
+                export_sequence.nla_state.frame_end = nla_strip_item.frame_end
+                export_sequence.fps = get_sequence_fps(context, pg.fps_source, pg.fps_custom, [nla_strip_item.action])
+                export_sequences.append(export_sequence)
+        else:
+            raise ValueError(f'Unhandled sequence source: {pg.sequence_source}')
+
+        options = PsaBuildOptions()
+        options.animation_data = animation_data
+        options.sequences = export_sequences
+        options.bone_filter_mode = pg.bone_filter_mode
+        options.bone_collection_indices = [x.index for x in pg.bone_collection_list if x.is_selected]
+        options.should_ignore_bone_name_restrictions = pg.should_enforce_bone_name_restrictions
+        options.sequence_name_prefix = pg.sequence_name_prefix
+        options.sequence_name_suffix = pg.sequence_name_suffix
+        options.root_motion = pg.root_motion
+
+        try:
+            psa = build_psa(context, options)
+            self.report({'INFO'}, f'PSA export successful')
+        except RuntimeError as e:
+            self.report({'ERROR_INVALID_CONTEXT'}, str(e))
+            return {'CANCELLED'}
+
+        write_psa(psa, self.filepath)
+
+        return {'FINISHED'}
+
+
+class PSA_OT_export_actions_select_all(Operator):
+    bl_idname = 'psa_export.sequences_select_all'
+    bl_label = 'Select All'
+    bl_description = 'Select all visible sequences'
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def get_item_list(cls, context):
+        pg = context.scene.psa_export
+        if pg.sequence_source == 'ACTIONS':
+            return pg.action_list
+        elif pg.sequence_source == 'TIMELINE_MARKERS':
+            return pg.marker_list
+        elif pg.sequence_source == 'NLA_TRACK_STRIPS':
+            return pg.nla_strip_list
+        return None
+
+    @classmethod
+    def poll(cls, context):
+        pg = getattr(context.scene, 'psa_export')
+        item_list = cls.get_item_list(context)
+        visible_sequences = get_visible_sequences(pg, item_list)
+        has_unselected_sequences = any(map(lambda item: not item.is_selected, visible_sequences))
+        return has_unselected_sequences
+
+    def execute(self, context):
+        pg = getattr(context.scene, 'psa_export')
+        sequences = self.get_item_list(context)
+        for sequence in get_visible_sequences(pg, sequences):
+            sequence.is_selected = True
+        return {'FINISHED'}
+
+
+class PSA_OT_export_actions_deselect_all(Operator):
+    bl_idname = 'psa_export.sequences_deselect_all'
+    bl_label = 'Deselect All'
+    bl_description = 'Deselect all visible sequences'
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def get_item_list(cls, context):
+        pg = context.scene.psa_export
+        if pg.sequence_source == 'ACTIONS':
+            return pg.action_list
+        elif pg.sequence_source == 'TIMELINE_MARKERS':
+            return pg.marker_list
+        elif pg.sequence_source == 'NLA_TRACK_STRIPS':
+            return pg.nla_strip_list
+        return None
+
+    @classmethod
+    def poll(cls, context):
+        item_list = cls.get_item_list(context)
+        has_selected_items = any(map(lambda item: item.is_selected, item_list))
+        return len(item_list) > 0 and has_selected_items
+
+    def execute(self, context):
+        pg = getattr(context.scene, 'psa_export')
+        item_list = self.get_item_list(context)
+        for sequence in get_visible_sequences(pg, item_list):
+            sequence.is_selected = False
+        return {'FINISHED'}
+
+
+class PSA_OT_export_bone_collections_select_all(Operator):
+    bl_idname = 'psa_export.bone_collections_select_all'
+    bl_label = 'Select All'
+    bl_description = 'Select all bone collections'
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        pg = getattr(context.scene, 'psa_export')
+        item_list = pg.bone_collection_list
+        has_unselected_items = any(map(lambda action: not action.is_selected, item_list))
+        return len(item_list) > 0 and has_unselected_items
+
+    def execute(self, context):
+        pg = getattr(context.scene, 'psa_export')
+        for item in pg.bone_collection_list:
+            item.is_selected = True
+        return {'FINISHED'}
+
+
+class PSA_OT_export_bone_collections_deselect_all(Operator):
+    bl_idname = 'psa_export.bone_collections_deselect_all'
+    bl_label = 'Deselect All'
+    bl_description = 'Deselect all bone collections'
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        pg = getattr(context.scene, 'psa_export')
+        item_list = pg.bone_collection_list
+        has_selected_actions = any(map(lambda action: action.is_selected, item_list))
+        return len(item_list) > 0 and has_selected_actions
+
+    def execute(self, context):
+        pg = getattr(context.scene, 'psa_export')
+        for action in pg.bone_collection_list:
+            action.is_selected = False
+        return {'FINISHED'}
+
+
+classes = (
+    PSA_OT_export,
+    PSA_OT_export_actions_select_all,
+    PSA_OT_export_actions_deselect_all,
+    PSA_OT_export_bone_collections_select_all,
+    PSA_OT_export_bone_collections_deselect_all,
+)
+
+io_scene_psk_psa\psa\export\properties.py
+import re
+import sys
+from fnmatch import fnmatch
+from typing import List, Optional
+
+from bpy.props import BoolProperty, PointerProperty, EnumProperty, FloatProperty, CollectionProperty, IntProperty, \
+    StringProperty
+from bpy.types import PropertyGroup, Object, Action, AnimData, Context
+
+from ...types import PSX_PG_bone_collection_list_item
+
+
+def psa_export_property_group_animation_data_override_poll(_context, obj):
+    return obj.animation_data is not None
+
+
+empty_set = set()
+
+
+class PSA_PG_export_action_list_item(PropertyGroup):
+    action: PointerProperty(type=Action)
+    name: StringProperty()
+    is_selected: BoolProperty(default=True)
+    frame_start: IntProperty(options={'HIDDEN'})
+    frame_end: IntProperty(options={'HIDDEN'})
+    is_pose_marker: BoolProperty(options={'HIDDEN'})
+
+
+class PSA_PG_export_timeline_markers(PropertyGroup):  # TODO: rename this to singular
+    marker_index: IntProperty()
+    name: StringProperty()
+    is_selected: BoolProperty(default=True)
+    frame_start: IntProperty(options={'HIDDEN'})
+    frame_end: IntProperty(options={'HIDDEN'})
+
+
+class PSA_PG_export_nla_strip_list_item(PropertyGroup):
+    name: StringProperty()
+    action: PointerProperty(type=Action)
+    frame_start: FloatProperty()
+    frame_end: FloatProperty()
+    is_selected: BoolProperty(default=True)
+
+
+def nla_track_update_cb(self: 'PSA_PG_export', context: Context) -> None:
+    self.nla_strip_list.clear()
+    if context.object is None or context.object.animation_data is None:
+        return
+    match = re.match(r'^(\d+).+$', self.nla_track)
+    self.nla_track_index = int(match.group(1)) if match else -1
+    if self.nla_track_index >= 0:
+        nla_track = context.object.animation_data.nla_tracks[self.nla_track_index]
+        for nla_strip in nla_track.strips:
+            strip: PSA_PG_export_nla_strip_list_item = self.nla_strip_list.add()
+            strip.action = nla_strip.action
+            strip.name = nla_strip.name
+            strip.frame_start = nla_strip.frame_start
+            strip.frame_end = nla_strip.frame_end
+
+
+def get_animation_data(pg: 'PSA_PG_export', context: Context) -> Optional[AnimData]:
+    animation_data_object = context.object
+    if pg.should_override_animation_data:
+        animation_data_object = pg.animation_data_override
+    return animation_data_object.animation_data if animation_data_object else None
+
+
+def nla_track_search_cb(self, context: Context, edit_text: str):
+    pg = getattr(context.scene, 'psa_export')
+    animation_data = get_animation_data(pg, context)
+    if animation_data is None:
+        return
+    for index, nla_track in enumerate(animation_data.nla_tracks):
+        yield f'{index} - {nla_track.name}'
+
+
+def animation_data_override_update_cb(self: 'PSA_PG_export', context: Context):
+    # Reset NLA track selection
+    self.nla_track = ''
+
+
+class PSA_PG_export(PropertyGroup):
+    root_motion: BoolProperty(
+        name='Root Motion',
+        options=empty_set,
+        default=False,
+        description='When enabled, the root bone will be transformed as it appears in the scene.\n\n'
+                    'You might want to disable this if you are exporting an animation for an armature that is '
+                    'attached to another object, such as a weapon or a shield',
+    )
+    should_override_animation_data: BoolProperty(
+        name='Override Animation Data',
+        options=empty_set,
+        default=False,
+        description='Use the animation data from a different object instead of the selected object',
+        update=animation_data_override_update_cb,
+    )
+    animation_data_override: PointerProperty(
+        type=Object,
+        update=animation_data_override_update_cb,
+        poll=psa_export_property_group_animation_data_override_poll
+    )
+    sequence_source: EnumProperty(
+        name='Source',
+        options=empty_set,
+        description='',
+        items=(
+            ('ACTIONS', 'Actions', 'Sequences will be exported using actions', 'ACTION', 0),
+            ('TIMELINE_MARKERS', 'Timeline Markers', 'Sequences are delineated by scene timeline markers', 'MARKER_HLT', 1),
+            ('NLA_TRACK_STRIPS', 'NLA Track Strips', 'Sequences are delineated by the start & end times of strips on the selected NLA track', 'NLA', 2)
+        )
+    )
+    nla_track: StringProperty(
+        name='NLA Track',
+        options=empty_set,
+        description='',
+        search=nla_track_search_cb,
+        update=nla_track_update_cb
+    )
+    nla_track_index: IntProperty(name='NLA Track Index', default=-1)
+    fps_source: EnumProperty(
+        name='FPS Source',
+        options=empty_set,
+        description='',
+        items=(
+            ('SCENE', 'Scene', '', 'SCENE_DATA', 0),
+            ('ACTION_METADATA', 'Action Metadata', 'The frame rate will be determined by action\'s FPS property found in the PSA Export panel.\n\nIf the Sequence Source is Timeline Markers, the lowest value of all contributing actions will be used', 'PROPERTIES', 1),
+            ('CUSTOM', 'Custom', '', 2)
+        )
+    )
+    fps_custom: FloatProperty(default=30.0, min=sys.float_info.epsilon, soft_min=1.0, options=empty_set, step=100,
+                              soft_max=60.0)
+    action_list: CollectionProperty(type=PSA_PG_export_action_list_item)
+    action_list_index: IntProperty(default=0)
+    marker_list: CollectionProperty(type=PSA_PG_export_timeline_markers)
+    marker_list_index: IntProperty(default=0)
+    nla_strip_list: CollectionProperty(type=PSA_PG_export_nla_strip_list_item)
+    nla_strip_list_index: IntProperty(default=0)
+    bone_filter_mode: EnumProperty(
+        name='Bone Filter',
+        options=empty_set,
+        description='',
+        items=(
+            ('ALL', 'All', 'All bones will be exported.'),
+            ('BONE_COLLECTIONS', 'Bone Collections', 'Only bones belonging to the selected bone collections and their '
+             'ancestors will be exported.'),
+        )
+    )
+    bone_collection_list: CollectionProperty(type=PSX_PG_bone_collection_list_item)
+    bone_collection_list_index: IntProperty(default=0, name='', description='')
+    should_enforce_bone_name_restrictions: BoolProperty(
+        default=False,
+        name='Enforce Bone Name Restrictions',
+        description='Bone names restrictions will be enforced. Note that bone names without properly formatted names '
+                    'may not be able to be referenced in-engine'
+    )
+    sequence_name_prefix: StringProperty(name='Prefix', options=empty_set)
+    sequence_name_suffix: StringProperty(name='Suffix', options=empty_set)
+    sequence_filter_name: StringProperty(
+        default='',
+        name='Filter by Name',
+        options={'TEXTEDIT_UPDATE'},
+        description='Only show items matching this name (use \'*\' as wildcard)')
+    sequence_use_filter_invert: BoolProperty(
+        default=False,
+        name='Invert',
+        options=empty_set,
+        description='Invert filtering (show hidden items, and vice versa)')
+    sequence_filter_asset: BoolProperty(
+        default=False,
+        name='Show assets',
+        options=empty_set,
+        description='Show actions that belong to an asset library')
+    sequence_filter_pose_marker: BoolProperty(
+        default=True,
+        name='Show pose markers',
+        options=empty_set)
+    sequence_use_filter_sort_reverse: BoolProperty(default=True, options=empty_set)
+    sequence_filter_reversed: BoolProperty(
+        default=True,
+        options=empty_set,
+        name='Show Reversed',
+        description='Show reversed sequences'
+    )
+
+
+def filter_sequences(pg: PSA_PG_export, sequences) -> List[int]:
+    bitflag_filter_item = 1 << 30
+    flt_flags = [bitflag_filter_item] * len(sequences)
+
+    if pg.sequence_filter_name:
+        # Filter name is non-empty.
+        for i, sequence in enumerate(sequences):
+            if not fnmatch(sequence.name, f'*{pg.sequence_filter_name}*'):
+                flt_flags[i] &= ~bitflag_filter_item
+
+        # Invert filter flags for all items.
+        if pg.sequence_use_filter_invert:
+            for i, sequence in enumerate(sequences):
+                flt_flags[i] ^= bitflag_filter_item
+
+    if not pg.sequence_filter_asset:
+        for i, sequence in enumerate(sequences):
+            if hasattr(sequence, 'action') and sequence.action is not None and sequence.action.asset_data is not None:
+                flt_flags[i] &= ~bitflag_filter_item
+
+    if not pg.sequence_filter_pose_marker:
+        for i, sequence in enumerate(sequences):
+            if hasattr(sequence, 'is_pose_marker') and sequence.is_pose_marker:
+                flt_flags[i] &= ~bitflag_filter_item
+
+    if not pg.sequence_filter_reversed:
+        for i, sequence in enumerate(sequences):
+            if sequence.frame_start > sequence.frame_end:
+                flt_flags[i] &= ~bitflag_filter_item
+
+    return flt_flags
+
+
+classes = (
+    PSA_PG_export_action_list_item,
+    PSA_PG_export_timeline_markers,
+    PSA_PG_export_nla_strip_list_item,
+    PSA_PG_export,
+)
+
+io_scene_psk_psa\psa\export\ui.py
+from typing import cast
+
+from bpy.types import UIList
+
+from .properties import PSA_PG_export_action_list_item, filter_sequences
+
+
+class PSA_UL_export_sequences(UIList):
+
+    def __init__(self):
+        super(PSA_UL_export_sequences, self).__init__()
+        # Show the filtering options by default.
+        self.use_filter_show = True
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        item = cast(PSA_PG_export_action_list_item, item)
+        is_pose_marker = hasattr(item, 'is_pose_marker') and item.is_pose_marker
+        layout.prop(item, 'is_selected', icon_only=True, text=item.name)
+        if hasattr(item, 'action') and item.action is not None and item.action.asset_data is not None:
+            layout.label(text='', icon='ASSET_MANAGER')
+
+        row = layout.row(align=True)
+        row.alignment = 'RIGHT'
+        if item.frame_end < item.frame_start:
+            row.label(text='', icon='FRAME_PREV')
+        if is_pose_marker:
+            row.label(text=item.action.name, icon='PMARKER')
+
+    def draw_filter(self, context, layout):
+        pg = getattr(context.scene, 'psa_export')
+        row = layout.row()
+        subrow = row.row(align=True)
+        subrow.prop(pg, 'sequence_filter_name', text='')
+        subrow.prop(pg, 'sequence_use_filter_invert', text='', icon='ARROW_LEFTRIGHT')
+
+        if pg.sequence_source == 'ACTIONS':
+            subrow = row.row(align=True)
+            subrow.prop(pg, 'sequence_filter_asset', icon_only=True, icon='ASSET_MANAGER')
+            subrow.prop(pg, 'sequence_filter_pose_marker', icon_only=True, icon='PMARKER')
+            subrow.prop(pg, 'sequence_filter_reversed', text='', icon='FRAME_PREV')
+
+    def filter_items(self, context, data, prop):
+        pg = getattr(context.scene, 'psa_export')
+        actions = getattr(data, prop)
+        flt_flags = filter_sequences(pg, actions)
+        flt_neworder = list(range(len(actions)))
+        return flt_flags, flt_neworder
+
+
+classes = (
+    PSA_UL_export_sequences,
+)

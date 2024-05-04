@@ -1,3 +1,433 @@
+can you merge this io_import_scene_unreal_psa_psk_283.py
+
+__init__.py
+# ##### BEGIN GPL LICENSE BLOCK #####
+#
+#  This program is free software; you can redistribute it and/or
+#  modify it under the terms of the GNU General Public License
+#  as published by the Free Software Foundation; either version 2
+#  of the License, or (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software Foundation,
+#  Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+#
+# ##### END GPL LICENSE BLOCK #####
+
+"""
+Version': '2.0' ported by Darknet
+
+Unreal Tournament PSK file to Blender mesh converter V1.0
+Author: D.M. Sturgeon (camg188 at the elYsium forum), ported by Darknet
+Imports a *psk file to a new mesh
+
+-No UV Texutre
+-No Weight
+-No Armature Bones
+-No Material ID
+-Export Text Log From Current Location File (Bool )
+"""
+
+"""
+Version': '2.7.*' edited by befzz
+Github: https://github.com/Befzz/blender3d_import_psk_psa
+- Pskx support
+- Animation import updated (bone orientation now works)
+- Skeleton import: auto-size, auto-orient bones
+- UVmap, mesh, weights, etc. import revised
+- Extra UVs import
+
+- No Scale support. (no test material)
+- No smoothing groups (not exported by umodel)
+"""
+
+"""
+Version': '2.8.0' edited by floxay
+- Vertex normals import (VTXNORMS chunk)
+        (requires custom UEViewer build /at the moment/)
+"""
+
+""" Version': '2.8.1' edited by Half
+- Morph targets import (MRPHINFO and MRPHDATA chunks)
+"""
+
+""" Version': '2.8.2' edited by Ka1serM
+- Blender 4.1 smoothing
+"""
+
+"""
+Version': '2.8.3' edited by Luner
+- matyalatte patch and merge
+"""
+
+"""
+Edited by matyalatte
+- Rename objects
+- Apply smooth shading
+- Set false to Down Scale as default
+- Change unit scale to 0.01
+- Add an UI panel to combine psk skeleton and gltf mesh
+- Split files
+"""
+
+# https://github.com/gildor2/UModel/blob/master/Exporters/Psk.h
+
+import bpy
+from . import psk_psa_importer, psa_exporter, combine_psk_and_gltf, export_as_fbx
+
+if "bpy" in locals():
+    import importlib
+    
+    importlib.reload(psk_psa_importer)
+    # importlib.reload(psa_exporter)
+    importlib.reload(combine_psk_and_gltf)
+    importlib.reload(export_as_fbx)
+
+bl_info = {
+    "name": "Import/Export Unreal Skeleton Mesh (.psk)/Animation Set (.psa) (283)",
+    "author":"Darknet, flufy3d, camg188, befzz, matyalatte, Half, Ka1serM, Luner",
+    "version": (2, 8, 3),
+    "blender": (4, 0, 0),
+    "location": "File > Import > Skeleton Mesh (.psk)/Animation Set (.psa) OR View3D > Tool Shelf (key T) > Misc. tab",
+    "description": "Import/Export Skeleton Mesh / Animation Data",
+    "warning": "",
+    "wiki_url": "https://github.com/Befzz/blender3d_import_psk_psa",
+    "category": "Import-Export",
+    "tracker_url": "https://github.com/Befzz/blender3d_import_psk_psa/issues"
+}
+
+def register():
+    psk_psa_importer.register()
+    # psa_exporter.register()
+    combine_psk_and_gltf.register()
+    export_as_fbx.register()
+
+def unregister():
+    psk_psa_importer.unregister()
+    # psa_exporter.register()
+    combine_psk_and_gltf.unregister()
+    export_as_fbx.unregister()
+
+combine_psk_and_gltf.py
+import bpy
+
+#combine psk and gltf
+def get_mesh(armature):
+    if armature.type!='ARMATURE':
+        raise RuntimeError('Not an armature.')
+    mesh=None
+    for child in armature.children:
+        if child.type=='MESH':
+            if mesh is not None:
+                raise RuntimeError('"The armature should have only 1 mesh."')
+            mesh=child
+    if mesh is None:
+        raise RuntimeError('Mesh Not Found')
+    return mesh
+
+def get_children(armature):
+    #get armature's mesh
+    mesh=get_mesh(armature)
+
+    #get materials and the names of uv maps
+    materials=mesh.data.materials
+    uv_names=[]
+    for uvmap in  mesh.data.uv_layers :
+            uv_names.append(uvmap.name)
+            
+    return mesh, materials
+
+def replace_materials(mesh, new_materials):
+    materials=mesh.data.materials
+    if len(materials)>len(new_materials):
+        raise RuntimeError('The number of materials is too large')
+    for i in range(len(materials)):
+        materials[i]=new_materials[i]
+
+def get_armature_modifier(mesh):
+    armature_modifier=None
+    for modifier in mesh.modifiers:
+        if modifier.type=='ARMATURE':
+            armature_modifier=modifier
+    if armature_modifier is None:
+        raise RuntimeError('Armature Modifier Not Found')
+    return armature_modifier
+        
+def combine_psk_and_gltf(psk_armature, gltf_armature):
+    bpy.context.view_layer.objects.active = psk_armature
+
+    mode = bpy.context.object.mode
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    #deselect all
+    for obj in bpy.context.scene.objects:
+        obj.select_set(False)    
+    
+    #get objects
+    psk_mesh, psk_materials = get_children(psk_armature)
+    gltf_mesh, _ = get_children(gltf_armature)
+    
+    psk_collection=psk_armature.users_collection
+    gltf_collection=gltf_armature.users_collection
+    
+    replace_materials(gltf_mesh, psk_materials)
+
+    gltf_mesh.parent = psk_armature
+    gltf_armature_modifier = get_armature_modifier(gltf_mesh)
+    gltf_armature_modifier.object = psk_armature
+
+    for col in gltf_collection:
+        col.objects.unlink(gltf_mesh)
+    for col in psk_collection:
+        col.objects.link(gltf_mesh)
+
+    gltf_armature.select_set(True)
+    psk_mesh.select_set(True)
+    bpy.ops.object.delete()
+    
+    bpy.ops.object.mode_set(mode=mode)
+    
+
+class Combine_OT_Run_Button(bpy.types.Operator):
+    '''Combine psk skeleton and gltf mesh.'''
+    bl_idname = "combine_psk_and_gltf.run_button"
+    bl_label = "Combine psk and gltf"
+    bl_options = {'REGISTER', 'UNDO'}
+    #--- properties ---#
+    success: bpy.props.StringProperty(default = "Success!", options = {'HIDDEN'})
+    
+    #--- execute ---#
+    def execute(self, context):
+        try:
+            psk_name='Armature'
+
+            #get gltf armature
+            selected = bpy.context.selected_objects
+            if len(selected)!=2:
+                raise RuntimeError('Select 2 armatures.')
+            psk = selected[0]
+            gltf=selected[1]
+            if psk.type!='ARMATURE' or gltf.type!='ARMATURE':
+                raise RuntimeError('Select 2 armatures.')
+
+            if 'Armature' in gltf.name:
+                psk, gltf = gltf, psk
+
+            if 'Armature' not in psk.name:
+                raise RuntimeError('At least one of the armatures should be "Armature".')
+
+            #main
+            combine_psk_and_gltf(psk, gltf)
+            self.report({'INFO'}, self.success)
+        
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+        
+        return {'FINISHED'}
+    
+class Combine_PT_Panel(bpy.types.Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "PSK / PSA"
+    bl_label = "Combine psk and gltf"
+
+    #--- draw ---#
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text='How to Use')
+        layout.label(text='1. Import psk')
+        layout.label(text='2. Import gltf')
+        layout.label(text='3. Select 2 armatures')
+        layout.label(text='4. Click the button below')        
+        layout.operator(Combine_OT_Run_Button.bl_idname, icon='MESH_DATA')
+
+classes = (
+        Combine_PT_Panel,
+        Combine_OT_Run_Button
+    )
+
+def register():
+    from bpy.utils import register_class
+    for cls in classes:
+        register_class(cls)
+
+def unregister():
+    from bpy.utils import unregister_class
+    for cls in classes:
+        unregister_class(cls)
+
+export_as_fbx.py
+import bpy
+from bpy.props import BoolProperty, PointerProperty, StringProperty, FloatProperty, EnumProperty
+
+def get_mesh(armature):
+    if armature.type!='ARMATURE':
+        raise RuntimeError('Not an armature.')
+    mesh=None
+    for child in armature.children:
+        if child.type=='MESH':
+            if mesh is not None:
+                raise RuntimeError('"The armature should have only 1 mesh."')
+            mesh=child
+    if mesh is None:
+        raise RuntimeError('Mesh Not Found')
+    return mesh
+
+def export_as_fbx(file, armature, global_scale, smooth_type, export_tangent):
+    
+    mode = bpy.context.object.mode
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    armature_name = armature.name
+    try:
+        true_armature = bpy.data.objects['Armature']
+    except Exception as e:
+        true_armature = None
+
+    if true_armature is not None:
+        true_armature.name = 'foobarfoobarfoobar'
+    armature.name = 'Armature'
+        
+    #deselect all
+    for obj in bpy.context.scene.objects:
+        obj.select_set(False)
+
+    mesh = get_mesh(armature)
+
+    #select objects
+    armature.select_set(True)
+    mesh.select_set(True)
+
+    #export as fbx
+    bpy.ops.export_scene.fbx( \
+        filepath=file,
+        use_selection=True,
+        use_active_collection=False,
+        global_scale=global_scale,
+        apply_unit_scale=True,
+        apply_scale_options='FBX_SCALE_NONE',
+        object_types=set(['ARMATURE','MESH']),
+        use_mesh_modifiers=True,
+        mesh_smooth_type=smooth_type,
+        use_tspace=export_tangent,
+        add_leaf_bones=False,
+        primary_bone_axis='Y',
+        secondary_bone_axis='X',
+        armature_nodetype='NULL',
+        bake_anim=False,
+        axis_forward='-Z',
+        axis_up='Y'
+        )
+
+    armature.name=armature_name
+    if true_armature is not None:
+        true_armature.name='Armature'
+
+    bpy.ops.object.mode_set(mode=mode)
+
+
+class Export_Inputs(bpy.types.PropertyGroup):
+    fGlobalScale : FloatProperty(
+        name = 'Scale',
+        description = 'Scale all data',
+        default = 1.0, min = 0.01, max = 100, step = 0.1, precision = 2,
+    )
+    bExportTangent: BoolProperty(
+        name = 'Export tangent',
+        description = 'Add binormal and tangent vectors.',
+        default = False
+    )
+    smooth_type : EnumProperty(
+        name = "Smoothing",
+        description = 'Export smoothing information.',
+        items = (('OFF', 'Normals Only','Export only normals'),
+                ('FACE','Face','Write face smoothing'),
+                ('EDGE','Edge','Write edge smoothing')),
+        default='FACE'
+    )
+
+class Export_OT_Run_Button(bpy.types.Operator):
+    '''Export an armature and its mesh as fbx.'''
+    bl_idname = "export_as_fbx.run_button"
+    bl_label = "Export as fbx"
+    bl_options = {'REGISTER', 'UNDO'}
+    #--- properties ---#
+    success: StringProperty(default = "Success!", options = {'HIDDEN'})
+    #--- execute ---#
+    def execute(self, context):
+        try:
+            #check save status
+            if not bpy.data.is_saved:
+                raise RuntimeError('Save .blend first.')
+            base_file_name=".".join(bpy.data.filepath.split('.')[:-1])
+
+            #get armature
+            selected = bpy.context.selected_objects
+            if len(selected)==0:
+                raise RuntimeError('Select an armature.')
+            armature=selected[0]
+            if armature.type!='ARMATURE':
+                raise RuntimeError('Select an armature.')
+
+            file = base_file_name + '_' + armature.name +'.fbx'
+            global_scale = context.scene.fbx_export_options.fGlobalScale
+            smooth_type = context.scene.fbx_export_options.smooth_type
+            export_tangent = context.scene.fbx_export_options.bExportTangent
+            #main
+            export_as_fbx(file, armature, global_scale, smooth_type, export_tangent)
+            self.report({'INFO'}, 'Success! {} has been generated.'.format(file))
+
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+        
+        return {'FINISHED'}
+    
+class Export_PT_Panel(bpy.types.Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "PSK / PSA"
+    bl_label = "Export as fbx"
+
+    #--- draw ---#
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text='How to Use')
+        layout.label(text='1. Save .blend')
+        layout.label(text='2. Select an armature')
+        layout.label(text='3. Click the button below')
+        layout.operator(Export_OT_Run_Button.bl_idname, icon='MESH_DATA')
+        layout.label(text='Options')
+        layout.prop(context.scene.fbx_export_options, 'fGlobalScale')
+        layout.prop(context.scene.fbx_export_options, 'smooth_type')
+        layout.prop(context.scene.fbx_export_options, 'bExportTangent')
+
+classes = (
+        Export_Inputs,
+        Export_PT_Panel,
+        Export_OT_Run_Button
+    )
+
+def register():
+    from bpy.utils import register_class
+    for cls in classes:
+        register_class(cls)
+
+    bpy.types.Scene.fbx_export_options = PointerProperty(type=Export_Inputs)
+
+def unregister():
+    from bpy.utils import unregister_class
+    for cls in classes:
+        unregister_class(cls)
+
+    del bpy.types.Scene.fbx_export_options
+
+psk_psa_importer.py
+# https://github.com/gildor2/UModel/blob/master/Exporters/Psk.h
 
 import bpy
 import re
@@ -250,6 +680,8 @@ def pskimport(filepath,
         bToSRGB = True,
         bSmoothShade = True,
         error_callback = None):
+    
+
     '''
     Import mesh and skeleton from .psk/.pskx files
     
@@ -264,7 +696,7 @@ def pskimport(filepath,
             
     '''
 
-    bpy.context.scene.unit_settings.scale_length=0.01
+    # bpy.context.scene.unit_settings.scale_length=0.01
 
     if not hasattr( error_callback, '__call__'):
         # error_callback = __pass
@@ -301,7 +733,9 @@ def pskimport(filepath,
     Extrauvs = []
     Normals = None
     WedgeIdx_by_faceIdx = None
-     
+    MorphInfos = None
+    MorphDeltas = None
+
     if not context:
         context = bpy.context
     #================================================================================================== 
@@ -491,8 +925,38 @@ def pskimport(filepath,
 
         for counter in range(chunk_datacount):
             Normals[counter] = unpack_data(chunk_data, counter * chunk_datasize)
- 
-             
+
+    # ==================================================================================================
+    # Morph Info MorphName | VertexCount
+
+    def read_morph_info():
+        if not bImportmesh:
+            return True
+
+        nonlocal MorphInfos
+        MorphInfos = [None] * chunk_datacount
+
+        unpack_data = Struct('=64si').unpack_from
+
+        for counter in range(chunk_datacount):
+            MorphInfos[counter] = unpack_data(chunk_data, counter * chunk_datasize)
+
+    # ==================================================================================================
+    # Morph Data PosX | PosY | PosZ | NormX | NormY | NormZ | Point Index
+
+    def read_morph_data():
+        if not bImportmesh:
+            return True
+
+        nonlocal MorphDeltas
+        MorphDeltas = [None] * chunk_datacount
+
+        unpack_data = Struct('6fi').unpack_from
+
+        for counter in range(chunk_datacount):
+            MorphDeltas[counter] = unpack_data(chunk_data, counter * chunk_datasize)
+
+
     CHUNKS_HANDLERS = {
         'PNTS0000': read_vertices,
         'VTXW0000': read_wedges,
@@ -506,7 +970,9 @@ def pskimport(filepath,
         'RAWWEIGH': read_weights,
         'VERTEXCO': read_vertex_colors, # VERTEXCOLOR
         'EXTRAUVS': read_extrauvs,
-        'VTXNORMS': read_normals
+        'VTXNORMS': read_normals,
+        'MRPHINFO': read_morph_info,
+        'MRPHDATA': read_morph_data
     }
     
     #===================================================================================================
@@ -567,6 +1033,16 @@ def pskimport(filepath,
             'mesh_object':  gen_name_part,
             'mesh_data':    gen_name_part
     }
+    '''
+    # file name w/out extension
+    gen_name_part = util_gen_name_part(filepath)
+    gen_names = {
+        'armature_object':  gen_name_part + '.ao',
+        'armature_data':    gen_name_part + '.ad',
+            'mesh_object':  gen_name_part + '.mo',
+            'mesh_data':    gen_name_part + '.md'
+    }
+    '''
     
     if bImportmesh:
         mesh_data = bpy.data.meshes.new(gen_names['mesh_data'])
@@ -985,8 +1461,33 @@ def pskimport(filepath,
         if Normals is not None:
             mesh_data.polygons.foreach_set("use_smooth", [True] * len(mesh_data.polygons))
             mesh_data.normals_split_custom_set_from_vertices(Normals)
-            mesh_data.use_auto_smooth = True
-                
+            if bpy.app.version < (4, 1, 0):
+                mesh_data.use_auto_smooth = True
+
+    # ==================================================================================================
+    # Morph Target. Set.
+
+        if MorphInfos is not None:
+            default_key = mesh_obj.shape_key_add(name="Default", from_mix=False)
+            default_key.interpolation = 'KEY_LINEAR'
+
+            morph_data_position = 0
+
+            scale = 0.01 if bScaleDown else 1.00
+
+            for (morph_name, vertex_count) in MorphInfos:
+                key = mesh_obj.shape_key_add(name=util_bytes_to_str(morph_name), from_mix=False)
+                key.interpolation = 'KEY_LINEAR'
+
+                for i in range(morph_data_position, morph_data_position+vertex_count):
+                    (pos_x, pos_y, pos_z, norm_x, norm_y, norm_z, index) = MorphDeltas[i]
+
+                    key.data[index].co += Vector((pos_x*scale, -pos_y*scale, pos_z*scale))
+                    # is there nowhere to add normal delta ??? normals will be unused for now ig
+
+                morph_data_position += vertex_count
+
+
     #===================================================================================================
     # UV. Set.
     
@@ -1097,26 +1598,46 @@ def pskimport(filepath,
     # Skeleton. Colorize.
     
     if bImportbone:
-    
-        bone_group_unused = armature_obj.pose.bone_groups.new(name = "Unused bones")
-        bone_group_unused.color_set = 'THEME14'
-
-        bone_group_nochild = armature_obj.pose.bone_groups.new(name = "No children")
-        bone_group_nochild.color_set = 'THEME03'
-
-        armature_data.show_group_colors = True
-
-        for psk_bone in psk_bones:
         
-            pose_bone = armature_obj.pose.bones[psk_bone.name]
-            
-            if psk_bone.have_weight_data:
-            
-                if len(psk_bone.children) == 0:
-                    pose_bone.bone_group = bone_group_nochild
-                    
-            else:
-                pose_bone.bone_group = bone_group_unused
+        if bpy.app.version < (4, 0, 0):
+        
+            bone_group_unused = armature_obj.pose.bone_groups.new(name = "Unused bones")
+            bone_group_unused.color_set = 'THEME14'
+    
+            bone_group_nochild = armature_obj.pose.bone_groups.new(name = "No children")
+            bone_group_nochild.color_set = 'THEME03'
+    
+            armature_data.show_group_colors = True
+    
+            for psk_bone in psk_bones:
+    
+                pose_bone = armature_obj.pose.bones[psk_bone.name]
+    
+                if psk_bone.have_weight_data:
+    
+                    if len(psk_bone.children) == 0:
+                        pose_bone.bone_group = bone_group_nochild
+    
+                else:
+                    pose_bone.bone_group = bone_group_unused
+        else:
+
+            bone_collection_unused = armature_data.collections.new("Unused bones")
+            bone_collection_nochild = armature_data.collections.new("No children")
+
+            for psk_bone in psk_bones:
+
+                pose_bone = armature_obj.pose.bones[psk_bone.name]
+
+                if psk_bone.have_weight_data:
+
+                    if len(psk_bone.children) == 0:
+                        bone_collection_nochild.assign(pose_bone)
+                        pose_bone.color.palette = 'THEME03'
+
+                else:
+                    bone_collection_unused.assign(pose_bone)
+                    pose_bone.color.palette = 'THEME14'
             
                     
     #===================================================================================================
@@ -1457,7 +1978,30 @@ def psaimport(filepath,
             Raw_Key_List[counter] = (pos * 0.01, quat)
         else:
             Raw_Key_List[counter] = (pos, quat)
-    
+
+    #============================================================================================== 
+    # Raw scale keys (VScaleAnimKey) 3f vec, 1f time
+    #============================================================================================== 
+    curr_pos = psafile.tell() # save current position
+    psafile.seek(0, 2) # seek to end
+
+    if (curr_pos != psafile.tell()): # make sure not eof
+        psafile.seek(curr_pos) # seek back to previous pos
+        read_chunk()
+
+        Raw_ScaleKey_List = [None] * chunk_datacount
+
+        unpack_data = Struct('3f4x').unpack_from
+
+        for counter in range(chunk_datacount):
+            scale = Vector()
+
+            (scale.x,  scale.y,  scale.z) = unpack_data( chunk_data, chunk_datasize * counter)
+
+            Raw_ScaleKey_List[counter] = scale
+
+
+
     psafile.close()
     
     utils_set_mode('OBJECT')
@@ -1530,7 +2074,18 @@ def psaimport(filepath,
                 psa_bone.fcurve_loc_x = action.fcurves.new(data_path, index = 0)
                 psa_bone.fcurve_loc_y = action.fcurves.new(data_path, index = 1)
                 psa_bone.fcurve_loc_z = action.fcurves.new(data_path, index = 2)
-            
+
+            if Raw_ScaleKey_List:
+                data_path = pose_bone.path_from_id("scale")
+                psa_bone.fcurve_scale_x = action.fcurves.new(data_path, index = 0)
+                psa_bone.fcurve_scale_y = action.fcurves.new(data_path, index = 1)
+                psa_bone.fcurve_scale_z = action.fcurves.new(data_path, index = 2)
+
+
+                psa_bone.fcurve_scale_x.keyframe_points.add(keyframes)
+                psa_bone.fcurve_scale_y.keyframe_points.add(keyframes)
+                psa_bone.fcurve_scale_z.keyframe_points.add(keyframes)
+
             # 1. Pre-add keyframes! \0/
             # 2. Set data: keyframe_points[].co[0..1]
             # 3. If 2 is not done, do 4: (important!!!)
@@ -1644,7 +2199,19 @@ def psaimport(filepath,
                     psa_bone.fcurve_loc_x.keyframe_points[i].interpolation = fcurve_interpolation
                     psa_bone.fcurve_loc_y.keyframe_points[i].interpolation = fcurve_interpolation
                     psa_bone.fcurve_loc_z.keyframe_points[i].interpolation = fcurve_interpolation
-                
+
+                if Raw_ScaleKey_List:
+                    scale = Raw_ScaleKey_List[raw_key_index]
+
+                    psa_bone.fcurve_scale_x.keyframe_points[i].co = i, scale.x
+                    psa_bone.fcurve_scale_y.keyframe_points[i].co = i, scale.y
+                    psa_bone.fcurve_scale_z.keyframe_points[i].co = i, scale.z
+
+                    psa_bone.fcurve_scale_x.keyframe_points[i].interpolation = fcurve_interpolation
+                    psa_bone.fcurve_scale_y.keyframe_points[i].interpolation = fcurve_interpolation
+                    psa_bone.fcurve_scale_z.keyframe_points[i].interpolation = fcurve_interpolation
+
+
                 # Old path. Slower.
                 # psa_bone.fcurve_quat_w.keyframe_points.insert(i,quat.w,{'NEEDED','FAST'}).interpolation = fcurve_interpolation
                 # psa_bone.fcurve_quat_x.keyframe_points.insert(i,quat.x,{'NEEDED','FAST'}).interpolation = fcurve_interpolation
@@ -1813,7 +2380,7 @@ class ImportProps():
     bScaleDown : BoolProperty(
             name = "Scale down",
             description = " * Used by PSK and PSA.\n * Multiply coordinates by 0.01\n * From \"cm.\" to \"m.\"",
-            default = False,
+            default = True,
             )
     bToSRGB : BoolProperty(
             name = "sRGB vertex color",
@@ -1957,7 +2524,8 @@ class IMPORT_OT_psk(bpy.types.Operator, ImportProps):
                     "bUpdateTimelineRange",
                     "bRotationOnly",
                     "files", 
-                    "directory"
+                    "directory",
+                    "bSmoothShade"
                     )
                 )
                 

@@ -75,25 +75,23 @@ Edited by matyalatte
 # https://github.com/gildor2/UModel/blob/master/Exporters/Psk.h
 
 import bpy
-from . import io_import_scene_unreal_psa_psk_283
-from . import combine_psk_and_gltf, export_as_fbx
+from . import psk_psa_importer, psa_exporter, combine_psk_and_gltf, export_as_fbx
 
 if "bpy" in locals():
     import importlib
-    if "io_import_scene_unreal_psa_psk_410andpatch" in locals():
-        importlib.reload(io_import_scene_unreal_psa_psk_283)
-    if "combine_psk_and_gltf" in locals():
-        importlib.reload(combine_psk_and_gltf)
-    if "export_as_fbx" in locals():
-        importlib.reload(export_as_fbx)
+    
+    importlib.reload(psk_psa_importer)
+    # importlib.reload(psa_exporter)
+    importlib.reload(combine_psk_and_gltf)
+    importlib.reload(export_as_fbx)
 
 bl_info = {
-    "name": "Import Unreal Skeleton Mesh (.psk)/Animation Set (.psa) (283)",
+    "name": "Import/Export Unreal Skeleton Mesh (.psk)/Animation Set (.psa) (283)",
     "author":"Darknet, flufy3d, camg188, befzz, matyalatte, Half, Ka1serM, Luner",
     "version": (2, 8, 3),
     "blender": (4, 0, 0),
     "location": "File > Import > Skeleton Mesh (.psk)/Animation Set (.psa) OR View3D > Tool Shelf (key T) > Misc. tab",
-    "description": "Import Skeleton Mesh / Animation Data",
+    "description": "Import/Export Skeleton Mesh / Animation Data",
     "warning": "",
     "wiki_url": "https://github.com/Befzz/blender3d_import_psk_psa",
     "category": "Import-Export",
@@ -101,11 +99,13 @@ bl_info = {
 }
 
 def register():
-    io_import_scene_unreal_psa_psk_283.register()
+    psk_psa_importer.register()
+    # psa_exporter.register()
     combine_psk_and_gltf.register()
     export_as_fbx.register()
 
 def unregister():
-    io_import_scene_unreal_psa_psk_283.unregister()
+    psk_psa_importer.unregister()
+    # psa_exporter.register()
     combine_psk_and_gltf.unregister()
     export_as_fbx.unregister()
